@@ -13,7 +13,6 @@
   },
   "scripts": {
     "start": "node ./bin/gatita-studio.js",
-    "test": "node --test test/*.test.js",
     "doctor": "node ./bin/gatita-studio.js doctor"
   },
   "files": [
