@@ -2137,6 +2137,9 @@ export class App {
     if (dialog.type === 'permissions') {
       return ['edit', 'write', 'shell', 'web', 'computer', 'mcp', 'plugin'];
     }
+    if (dialog.type === 'settings') {
+      return this.settingsEntries();
+    }
     return [];
   }
 

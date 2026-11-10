@@ -273,6 +273,79 @@ export function renderMarkdown(text, width, styler, { base = 'text', indent = ''
   return lines;
 }
 
+const ANSI_ESCAPE = /^\u001b\[[0-?]*[ -/]*[@-~]$/;
+
+// Wrap styled text by visible width. ANSI sequences are zero-width, so colors
+// survive wrapping. Long words are split; ordinary words are wrapped at spaces.
+export function wrapStyledLines(line, width) {
+  const max = Math.max(1, width);
+  const output = [];
+  for (const physicalLine of String(line ?? '').split('\n')) {
+    const items = [];
+    for (const token of String(physicalLine).split(/(\u001b\[[0-?]*[ -/]*[@-~])/g)) {
+      if (!token) continue;
+      if (ANSI_ESCAPE.test(token)) {
+        items.push({ type: 'ansi', text: token, width: 0 });
+        continue;
+      }
+      for (const piece of token.split(/(\s+)/)) {
+        if (!piece) continue;
+        if (/^\s+$/.test(piece)) items.push({ type: 'space', text: ' ', width: 1 });
+        else items.push({ type: 'word', text: piece, width: visibleWidth(piece) });
+      }
+    }
+    let current = [];
+    let currentWidth = 0;
+    const flush = () => {
+      output.push(current.length ? `${current.map((item) => item.text).join('')}\x1b[0m` : '');
+      current = [];
+      currentWidth = 0;
+    };
+    for (const item of items) {
+      if (item.type === 'ansi') {
+        current.push(item);
+        continue;
+      }
+      if (item.type === 'space') {
+        if (!current.length || currentWidth >= max) {
+          if (currentWidth >= max) flush();
+          continue;
+        }
+        current.push(item);
+        currentWidth += 1;
+        continue;
+      }
+      if (item.type === 'word') {
+        if (currentWidth + item.width > max && current.length) flush();
+        if (item.width > max) {
+          let chunk = [];
+          let chunkWidth = 0;
+          for (const char of item.text) {
+            const charWidth = visibleWidth(char);
+            if (chunkWidth + charWidth > max && chunk.length) {
+              current.push(...chunk);
+              flush();
+              chunk = [];
+              chunkWidth = 0;
+            }
+            chunk.push({ type: 'word', text: char, width: charWidth });
+            chunkWidth += charWidth;
+          }
+          if (chunk.length) {
+            current.push(...chunk);
+            currentWidth = chunkWidth;
+          }
+        } else {
+          current.push(item);
+          currentWidth += item.width;
+        }
+      }
+    }
+    flush();
+  }
+  return output.length ? output : [''];
+}
+
 export function progressBar(percent, width, styler, color = 'accent') {
   const max = Math.max(1, width);
   const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
@@ -282,10 +355,13 @@ export function progressBar(percent, width, styler, color = 'accent') {
 
 export function roundedBox({ width, lines, styler, title = '', padding = 1, background = 'surface', borderColor = 'border' }) {
   const inner = Math.max(4, width - 2);
+  const contentWidth = Math.max(1, inner - padding * 2);
   const padded = [];
   for (const line of lines) {
-    const text = truncateVisible(line, inner - padding * 2);
-    padded.push(`${styler.bg(background, ' '.repeat(padding))}${styler.bg(background, padEndVisible(text, inner - padding * 2))}${styler.bg(background, ' '.repeat(padding))}`);
+    for (const wrapped of wrapStyledLines(line, contentWidth)) {
+      const text = truncateVisible(wrapped, contentWidth);
+      padded.push(`${styler.bg(background, ' '.repeat(padding))}${styler.bg(background, padEndVisible(text, contentWidth))}${styler.bg(background, ' '.repeat(padding))}`);
+    }
   }
   const titleText = title ? ` ${title} ` : '';
   const topFill = Math.max(0, inner - visibleWidth(titleText) - 1);
