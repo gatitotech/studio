@@ -1,0 +1,36 @@
+{
+  "name": "gatita-studio",
+  "version": "0.2.0",
+  "description": "Gatita Studio, a full-screen terminal coding agent for Gatita.",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "gatita-studio": "./bin/gatita-studio.js",
+    "gst": "./bin/gatita-studio.js"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node ./bin/gatita-studio.js",
+    "test": "node --test test/*.test.js",
+    "doctor": "node ./bin/gatita-studio.js doctor"
+  },
+  "files": [
+    "bin",
+    "src/cli",
+    "src/shared",
+    "src/tools",
+    "src/computer",
+    "src/mcp",
+    "src/plugins",
+    "src/skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gatitotech/studio.git"
+  }
+}

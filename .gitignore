@@ -1,0 +1,14 @@
+node_modules/
+.gatita-studio/
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.local
+.env.*.local
+*.log
+coverage/
+dist/
+.DS_Store
+Thumbs.db
