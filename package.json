@@ -26,6 +26,7 @@
     "src/plugins",
     "src/skills",
     "README.md",
+    "assets",
     "LICENSE"
   ],
   "license": "GPL-3.0-only",

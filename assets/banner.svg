@@ -1,0 +1,54 @@
+<svg width="1200" height="360" viewBox="0 0 1200 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Gatita Studio banner</title>
+  <desc id="desc">G A T I T A   S T U D I O — Your terminal. Her territory.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1115"/>
+      <stop offset=".52" stop-color="#151821"/>
+      <stop offset="1" stop-color="#1e222b"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.72" cy="0.42" r="0.5">
+      <stop offset="0" stop-color="#f2b35c" stop-opacity="0.24"/>
+      <stop offset=".55" stop-color="#f2b35c" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#0f1115" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="pattern" width="42" height="42" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.1" fill="#2b303b" opacity=".72"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="360" rx="28" fill="url(#bg)"/>
+  <rect width="1200" height="360" rx="28" fill="url(#pattern)" opacity=".58"/>
+  <rect width="1200" height="360" rx="28" fill="url(#glow)"/>
+  <rect x="1.5" y="1.5" width="1197" height="357" rx="26.5" fill="none" stroke="#2b303b" stroke-opacity=".85"/>
+
+  <g transform="translate(890 33)" opacity=".96">
+    <path d="M58 64 82 2 119 58Z" fill="#1e222b" stroke="#f2b35c" stroke-opacity=".38" stroke-width="2" stroke-linejoin="round"/>
+    <path d="M222 64 198 2 161 58Z" fill="#1e222b" stroke="#f2b35c" stroke-opacity=".38" stroke-width="2" stroke-linejoin="round"/>
+    <path d="M76 54 88 24 103 51Z" fill="#e58b8b" opacity=".5"/>
+    <path d="M204 54 192 24 177 51Z" fill="#e58b8b" opacity=".5"/>
+    <ellipse cx="140" cy="129" rx="112" ry="91" fill="#171a21" stroke="#f2b35c" stroke-opacity=".42" stroke-width="3"/>
+    <ellipse cx="99" cy="127" rx="17" ry="10" fill="#f2b35c"/>
+    <ellipse cx="181" cy="127" rx="17" ry="10" fill="#f2b35c"/>
+    <rect x="95.8" y="121" width="6.8" height="13" rx="3.4" fill="#0f1115"/>
+    <rect x="177.8" y="121" width="6.8" height="13" rx="3.4" fill="#0f1115"/>
+    <path d="M128 156 Q140 166 152 156" fill="none" stroke="#9a958c" stroke-width="2.5" stroke-linecap="round"/>
+    <path d="M139 145h2" stroke="#e58b8b" stroke-width="6" stroke-linecap="round"/>
+    <path d="M30 129h52M19 143h48M28 157h40" stroke="#2b303b" stroke-opacity=".85" stroke-width="2" stroke-linecap="round"/>
+    <path d="M250 129h-52M261 143h-48M252 157h-40" stroke="#2b303b" stroke-opacity=".85" stroke-width="2" stroke-linecap="round"/>
+  </g>
+
+  <g transform="translate(70 56)" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="0" y="72" fill="#e8e4dc" font-size="54" font-weight="750" letter-spacing="7">GATITA</text>
+    <text x="0" y="132" fill="#f2b35c" font-size="34" font-weight="750" letter-spacing="13">STUDIO</text>
+    <text x="0" y="181" fill="#9a958c" font-size="22" letter-spacing=".2">Your terminal. Her territory.</text>
+    <g transform="translate(0 205)" font-size="14" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" fill="#9a958c">
+      <rect x="0" y="0" width="156" height="32" rx="16" fill="#1e222b" stroke="#2b303b"/>
+      <text x="78" y="21" text-anchor="middle">full-screen tui</text>
+      <rect x="170" y="0" width="127" height="32" rx="16" fill="#1e222b" stroke="#2b303b"/>
+      <text x="233" y="21" text-anchor="middle">plan mode</text>
+      <rect x="311" y="0" width="144" height="32" rx="16" fill="#1e222b" stroke="#2b303b"/>
+      <text x="383" y="21" text-anchor="middle">interactive tools</text>
+    </g>
+  </g>
+</svg>
