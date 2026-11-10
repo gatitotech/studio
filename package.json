@@ -1,6 +1,6 @@
 {
   "name": "gatita-studio",
-  "version": "0.2.0",
+  "version": "1.0.0-rc-1",
   "description": "Gatita Studio, a full-screen terminal coding agent for Gatita.",
   "type": "module",
   "private": false,
