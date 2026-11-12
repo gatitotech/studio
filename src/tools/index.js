@@ -3,6 +3,8 @@ import { createFsTools } from './fs.js';
 import { createBashTool } from './shell.js';
 import { createProcessTool } from './process.js';
 import { createPlanTool } from './plan.js';
+import { createGoalTool } from './goal.js';
+import { createTaskTools } from './tasks.js';
 import { createWebfetchTool, createWebsearchTool } from './web.js';
 import { createComputerTool } from '../computer/index.js';
 import { createSkillTool } from '../skills/index.js';
@@ -114,6 +116,8 @@ export function createToolRegistry({
   mcp = null,
   askManager = null,
   planManager = null,
+  goalManager = null,
+  taskManager = null,
   pluginTools = [],
   hooks = [],
   onTodos = null,
@@ -124,11 +128,13 @@ export function createToolRegistry({
     createBashTool({ cwd, config }),
     createProcessTool({ cwd, config }),
     createPlanTool({ planManager }),
+    createGoalTool({ goalManager }),
+    ...createTaskTools({ taskManager }),
     createWebfetchTool({ config }),
     createWebsearchTool({ config }),
     createTodoTool({ ctx }),
     createSkillTool({ skills }),
-  ];
+  ].filter(Boolean);
   if (computer) tools.push(createComputerTool({ computer }));
   if (askManager) tools.push(createAskTool({ askManager }), createAskStatusTool({ askManager }));
   if (mcp) tools.push(createMcpTool({ manager: mcp }));

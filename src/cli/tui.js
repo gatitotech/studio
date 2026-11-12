@@ -11,7 +11,8 @@ import { createComputerController } from '../computer/index.js';
 import { createToolRegistry } from '../tools/index.js';
 import { runAgent } from './agent.js';
 import { checkForUpdate, formatUpdateNotice } from './update.js';
-import { readClipboard, writeClipboard } from './clipboard.js';
+import { readClipboard, writeClipboard, readClipboardImage } from './clipboard.js';
+import { createTaskManager } from './tasks.js';
 import { playChime } from './sound.js';
 import { Terminal } from './tui/terminal.js';
 import { renderMarkdown, wrapPlain, roundedBox, progressBar, renderDialogBand, paintRow } from './tui/render.js';
@@ -40,6 +41,9 @@ import { truncateToWidth } from './theme.js';
 import { SLASH_COMMANDS, commandSuggestions, executeSlashCommand } from './tui/commands.js';
 import { skillSuggestions, extractSkillMentions } from '../skills/index.js';
 
+const MAX_COMPOSER_IMAGES = 8;
+const COMPOSER_TOKEN_RE = /\u0001([a-z]+):([a-zA-Z0-9]+)\u0001/g;
+
 const TOOL_ICONS = {
   read: '▤',
   write: '✎',
@@ -54,6 +58,9 @@ const TOOL_ICONS = {
   skill: '✦',
   computer: '▣',
   task: '◐',
+  goal: '◎',
+  task_status: '◐',
+  stop_task: '■',
 };
 
 function toolIcon(name) {
@@ -149,7 +156,10 @@ export class App {
     this.animationTimer = null;
     this.lastCtrlC = 0;
     this.expandedTools = new Set();
-    this.pendingImages = [];
+    this.composerAttachments = new Map();
+    this.composerTokenSeq = 0;
+    this.goal = null;
+    this.tasks = createTaskManager();
     this.online = true;
     this.sessionTokens = 0;
     this.lastTurnUsage = null;
@@ -192,7 +202,7 @@ export class App {
     // Injectable for tests; defaults to the OS sound player.
     this.soundPlayer = null;
     // Injectable for tests; defaults to the real clipboard.
-    this.clipboard = { read: readClipboard, write: writeClipboard };
+    this.clipboard = { read: readClipboard, write: writeClipboard, readImage: readClipboardImage };
     // Open multiple-choice questions (the `ask` tool): id → { questions, openedAt, expiresAt, status, results }.
     this.questions = new Map();
     this.nextQuestionId = 0;
@@ -263,6 +273,12 @@ export class App {
       planManager: {
         submit: ({ plan, questionsAsked = 0 }) => this.presentPlan(plan, questionsAsked),
       },
+      goalManager: {
+        get: () => this.goal,
+        complete: (summary) => this.completeGoal(summary),
+        block: (reason) => this.blockGoal(reason),
+      },
+      taskManager: this.tasks,
       pluginTools: this.plugins.tools,
       hooks: this.plugins.hooks,
       onTodos: (items) => {
@@ -321,6 +337,70 @@ export class App {
     this.recentChats = this.store.recentChats(30);
   }
 
+  goalStoreKey(chatId = this.chat?.id) {
+    return chatId ? `goal:${chatId}` : null;
+  }
+
+  loadGoal(chatId = this.chat?.id) {
+    this.goal = null;
+    const key = this.goalStoreKey(chatId);
+    if (!key) return;
+    try {
+      const value = JSON.parse(this.store.getSetting(key, 'null'));
+      if (value?.text && ['active', 'complete', 'blocked'].includes(value.status)) this.goal = value;
+    } catch {
+      this.goal = null;
+    }
+  }
+
+  persistGoal() {
+    const key = this.goalStoreKey();
+    if (!key || !this.store) return;
+    this.store.setSetting(key, this.goal ? JSON.stringify(this.goal) : '');
+  }
+
+  setGoal(text) {
+    const value = String(text || '').trim().slice(0, 4_000);
+    if (!value) return null;
+    this.goal = { text: value, status: 'active', startedAt: Date.now(), summary: '' };
+    this.persistGoal();
+    this.setFlash('Goal set. Gatita will keep working until it is complete.', 'success');
+    this.requestRender();
+    return this.goal;
+  }
+
+  completeGoal(summary = '') {
+    if (!this.goal || this.goal.status !== 'active') return false;
+    if ((this.todos || []).some((item) => item.status === 'pending' || item.status === 'in_progress')) {
+      this.setFlash('Finish or cancel unfinished todo items before completing the goal.', 'warning');
+      return false;
+    }
+    this.goal.status = 'complete';
+    this.goal.summary = String(summary || '').trim().slice(0, 4_000);
+    this.goal.completedAt = Date.now();
+    this.persistGoal();
+    this.setFlash('Goal complete.', 'success');
+    this.requestRender();
+    return true;
+  }
+
+  blockGoal(reason = '') {
+    if (!this.goal || this.goal.status !== 'active') return false;
+    this.goal.status = 'blocked';
+    this.goal.summary = String(reason || '').trim().slice(0, 4_000);
+    this.goal.blockedAt = Date.now();
+    this.persistGoal();
+    this.setFlash('Goal blocked. Gatita needs your input.', 'warning');
+    this.requestRender();
+    return true;
+  }
+
+  clearGoal({ persist = true } = {}) {
+    this.goal = null;
+    if (persist) this.persistGoal();
+    this.requestRender();
+  }
+
   loadChat(id, { silent = false } = {}) {
     const chat = this.store.findChat(id);
     if (!chat) {
@@ -330,6 +410,7 @@ export class App {
     this.chat = chat;
     this.messages = this.store.listMessages(chat.id);
     this.todos = this.store.listTodos(chat.id);
+    this.loadGoal(chat.id);
     this.cwd = chat.cwd || this.cwd;
     this.modelId = chat.model || this.modelId;
     this.reasoning = chat.reasoning || this.reasoning;
@@ -360,6 +441,7 @@ export class App {
     this.chat = chat;
     this.messages = [];
     this.todos = [];
+    this.goal = null;
     this.registry?.setChat(chat.id);
     this.config.lastChatId = chat.id;
     saveConfig(this.config);
@@ -552,7 +634,175 @@ export class App {
     }).join('');
   }
 
+  composerTokens(text = this.input) {
+    const source = String(text ?? '');
+    const tokens = [];
+    for (const match of source.matchAll(COMPOSER_TOKEN_RE)) {
+      const entry = this.composerAttachments.get(match[2]);
+      if (!entry || entry.kind !== match[1]) continue;
+      tokens.push({
+        ...entry,
+        id: match[2],
+        kind: match[1],
+        marker: match[0],
+        start: match.index,
+        end: match.index + match[0].length,
+      });
+    }
+    return tokens;
+  }
+
+  composerTokenLabel(entry, imageNumber = 1) {
+    if (entry.kind === 'image') return `[Image ${imageNumber}]`;
+    const count = Math.max(1, Number(entry.lines) || 1);
+    return count === 1 ? '[1 Pasted Line]' : `[${count} Pasted Lines]`;
+  }
+
+  composerTokenLabels(text = this.input) {
+    const labels = new Map();
+    let imageNumber = 0;
+    for (const token of this.composerTokens(text)) {
+      if (token.kind === 'image') imageNumber += 1;
+      labels.set(token.id, this.composerTokenLabel(token, imageNumber));
+    }
+    return labels;
+  }
+
+  expandComposerText(text = this.input) {
+    const source = String(text ?? '');
+    const labels = this.composerTokenLabels(source);
+    const tokens = this.composerTokens(source);
+    let output = '';
+    let cursor = 0;
+    for (const token of tokens) {
+      output += source.slice(cursor, token.start);
+      output += token.kind === 'image' ? labels.get(token.id) || '' : token.text || '';
+      cursor = token.end;
+    }
+    return output + source.slice(cursor);
+  }
+
+  composerImages(text = this.input) {
+    return this.composerTokens(text)
+      .filter((token) => token.kind === 'image' && token.dataUrl)
+      .map((token) => ({
+        path: token.path || '',
+        mediaType: token.mediaType || 'image/png',
+        dataUrl: token.dataUrl,
+      }));
+  }
+
+  addComposerToken(token) {
+    const id = `t${this.composerTokenSeq + 1}`;
+    this.composerTokenSeq += 1;
+    const entry = { ...token, id };
+    this.composerAttachments.set(id, entry);
+    const marker = `\u0001${entry.kind}:${id}\u0001`;
+    const start = this.cursor;
+    this.input = this.input.slice(0, this.cursor) + marker + this.input.slice(this.cursor);
+    this.cursor += marker.length;
+    this.suggestionIndex = 0;
+    this.followBottom = true;
+    this.requestRender();
+    return { ...entry, start, end: this.cursor };
+  }
+
+  attachImage({ path: file = '', name = '', mediaType = 'image/png', dataUrl = '' } = {}) {
+    if (!dataUrl || !String(dataUrl).startsWith('data:image/')) {
+      this.setFlash('That image could not be read.', 'danger');
+      return null;
+    }
+    if (this.composerImages().length >= MAX_COMPOSER_IMAGES) {
+      this.setFlash(`You can attach up to ${MAX_COMPOSER_IMAGES} images at a time.`, 'warning');
+      return null;
+    }
+    const entry = this.addComposerToken({ kind: 'image', path: file, name, mediaType, dataUrl });
+    const model = this.model();
+    if (model && !model.vision) {
+      this.setFlash(`Attached ${name || 'image'}. ${model.name} cannot read images; switch with /model.`, 'warning');
+    } else {
+      this.setFlash(`Attached ${name || 'image'}.`, 'success');
+    }
+    return entry;
+  }
+
+  insertPastedText(rawText) {
+    const text = String(rawText ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').slice(0, 100_000);
+    if (!text) return false;
+    if (!text.includes('\n')) {
+      this.insertText(text);
+      return true;
+    }
+    this.addComposerToken({ kind: 'paste', text, lines: text.split('\n').length });
+    return true;
+  }
+
+  removeComposerToken(token) {
+    if (!token) return;
+    this.input = this.input.slice(0, token.start) + this.input.slice(token.end);
+    this.composerAttachments.delete(token.id);
+    if (this.cursor >= token.end) this.cursor -= token.end - token.start;
+    else if (this.cursor > token.start) this.cursor = token.start;
+    this.suggestionIndex = 0;
+  }
+
+  clearComposerImages() {
+    let removed = 0;
+    for (const token of [...this.composerTokens()].reverse()) {
+      if (token.kind !== 'image') continue;
+      this.removeComposerToken(token);
+      removed += 1;
+    }
+    this.pruneComposerAttachments();
+    this.requestRender();
+    return removed;
+  }
+
+  pruneComposerAttachments() {
+    const present = new Set([...this.input.matchAll(COMPOSER_TOKEN_RE)].map((match) => match[2]));
+    for (const id of [...this.composerAttachments.keys()]) {
+      if (!present.has(id)) this.composerAttachments.delete(id);
+    }
+  }
+
+  composerPreviousIndex(index) {
+    const token = this.composerTokens().find((entry) => entry.end === index || (index > entry.start && index < entry.end));
+    if (token) return token.start;
+    return codePointBefore(this.input, index);
+  }
+
+  composerNextIndex(index) {
+    const token = this.composerTokens().find((entry) => entry.start === index || (index > entry.start && index < entry.end));
+    if (token) return token.end;
+    return codePointAfter(this.input, index);
+  }
+
+  composerTokenAtStart(index) {
+    return this.composerTokens().find((entry) => entry.start === index) || null;
+  }
+
+  composerTokenAtEnd(index) {
+    return this.composerTokens().find((entry) => entry.end === index) || null;
+  }
+
+  styleComposerLine(line, labels, cursor = null, lineStart = 0) {
+    const s = this.styler;
+    return String(line).replace(COMPOSER_TOKEN_RE, (marker, kind, id, offset) => {
+      const label = labels.get(id);
+      if (!label) return '';
+      const foreground = kind === 'image' ? 'image' : 'paste';
+      const background = kind === 'image' ? 'imageBg' : 'pasteBg';
+      const labelAtCursor = cursor !== null && lineStart + offset === cursor;
+      const styledLabel = labelAtCursor ? `${s.inverse(label[0])}${label.slice(1)}` : label;
+      return s.bg(background, s.bold(s.fg(foreground, styledLabel)));
+    });
+  }
+
   layoutInput(text, cursor, width) {
+    const source = String(text ?? '');
+    const tokens = this.composerTokens(source);
+    const tokensByStart = new Map(tokens.map((token) => [token.start, token]));
+    const labels = this.composerTokenLabels(source);
     const lines = [];
     const lineStarts = [];
     let line = '';
@@ -561,33 +811,50 @@ export class App {
     let cursorCol = 0;
     let index = 0;
     let lineStartIndex = 0;
+    const maxWidth = Math.max(1, width);
     const pushLine = () => {
       lines.push(line);
       lineStarts.push(lineStartIndex);
       line = '';
       col = 0;
     };
-    for (const char of String(text)) {
+    while (index < source.length) {
       if (index === cursor) {
         cursorLine = lines.length;
         cursorCol = col;
       }
+      const token = tokensByStart.get(index);
+      if (token) {
+        const tokenWidth = visibleWidth(labels.get(token.id) || '');
+        if (col > 0 && col + tokenWidth > maxWidth) {
+          pushLine();
+          lineStartIndex = index;
+        }
+        line += token.marker;
+        col += tokenWidth;
+        index = token.end;
+        if (cursor > token.start && cursor < token.end) {
+          cursorLine = lines.length;
+          cursorCol = Math.max(0, col - tokenWidth);
+        }
+        continue;
+      }
+      const char = String.fromCodePoint(source.codePointAt(index));
       if (char === '\n') {
         pushLine();
         lineStartIndex = index + 1;
         index += 1;
         continue;
       }
-      const charWidth = visibleWidth(char);
-      if (col + charWidth > width) {
+      if (col > 0 && col + visibleWidth(char) > maxWidth) {
         pushLine();
         lineStartIndex = index;
       }
       line += char;
-      col += charWidth;
+      col += visibleWidth(char);
       index += char.length;
     }
-    if (cursor === String(text).length) {
+    if (cursor === source.length) {
       cursorLine = lines.length;
       cursorCol = col;
     }
@@ -613,7 +880,7 @@ export class App {
     this.requestRender();
   }
 
-  async sendPrompt(rawText) {
+  async sendPrompt(rawText, { images: attachedImages = null } = {}) {
     const text = String(rawText || '').trim();
     if (!text || this.running) return;
     this.lastError = null;
@@ -626,7 +893,10 @@ export class App {
       this.setFlash(`${model.name} needs ${model.requiredPlan}.`, 'warning');
       return;
     }
-    if (this.pendingImages.length && !model.vision) {
+    const images = Array.isArray(attachedImages)
+      ? attachedImages.filter((image) => image?.dataUrl).slice(0, MAX_COMPOSER_IMAGES)
+      : [];
+    if (images.length && !model.vision) {
       this.setFlash(`${model.name} cannot read images. Switch to Gatita Aura.`, 'warning');
       return;
     }
@@ -634,6 +904,8 @@ export class App {
     this.pushHistory(text);
     this.input = '';
     this.cursor = 0;
+    this.composerAttachments.clear();
+    this.composerScroll = 0;
     if (!this.chat) {
       this.newChat({ title: makeTitle(text), folderId: this.config.lastFolderId || null, cwd: this.cwd, startFresh: false });
     } else if (this.chat.title === 'New chat') {
@@ -641,12 +913,12 @@ export class App {
       this.chat.title = makeTitle(text);
       this.refreshSidebar();
     }
-    const images = this.pendingImages.map((image) => image.dataUrl);
-    this.pendingImages = [];
+    if (this.goal?.status === 'active') this.persistGoal();
+    const imageUrls = images.map((image) => image.dataUrl);
     this.store.addMessage(this.chat.id, {
       role: 'user',
       content: text,
-      meta: images.length ? { images } : null,
+      meta: imageUrls.length ? { images: imageUrls } : null,
     });
     this.messages = this.store.listMessages(this.chat.id);
     this.transcriptCache.clear();
@@ -679,6 +951,8 @@ export class App {
         reasoning: this.reasoning,
         registry: this.registry,
         mode: this.mode,
+        goal: this.goal?.status === 'active' ? this.goal : null,
+        tasks: this.tasks,
         takeSteering: () => this.drainSteering(),
         extraPrompt: mentionedPrompt,
         approve: (request) => this.requestApproval(request),
@@ -710,19 +984,24 @@ export class App {
       this.refreshAccount();
       const failed = Boolean(result?.error);
       const leftover = !failed && !result?.aborted ? this.drainSteering() : [];
-      if (leftover.length) await this.sendPrompt(leftover.join('\n\n'));
+      if (leftover.length) {
+        const leftoverText = leftover.map((item) => item?.text ?? item ?? '').filter(Boolean).join('\n\n');
+        const leftoverImages = leftover.flatMap((item) => (Array.isArray(item?.images) ? item.images : []));
+        if (leftoverText.trim()) await this.sendPrompt(leftoverText, { images: leftoverImages });
+      }
       const pending = this.pendingBuildPlan;
       this.pendingBuildPlan = null;
       if (pending && !failed) await this.sendPrompt(`Build this plan:\n\n${pending}`);
     }
   }
 
-  queueSteering(rawText) {
+  queueSteering(rawText, { images = [] } = {}) {
     const text = String(rawText || '').trim();
     if (!text || !this.running) return false;
-    this.steeringQueue.push(text);
+    this.steeringQueue.push({ text, images: Array.isArray(images) ? images : [] });
     this.input = '';
     this.cursor = 0;
+    this.composerAttachments.clear();
     this.suggestionIndex = 0;
     this.composerScroll = 0;
     this.setToast(`queued steering #${this.steeringQueue.length}`, 'accent');
@@ -776,6 +1055,10 @@ export class App {
         } else {
           this.lastError = null;
         }
+        break;
+      case 'tool_backgrounded':
+        this.activeTool = null;
+        this.setFlash(`${event.tool || 'tool'} is still running · ${event.taskId || 'background task'} · use stop_task to cancel`, 'info');
         break;
       case 'assistant':
         this.stream = { active: true, text: '', reasoning: '', startedAt: this.stream.startedAt, awaiting: true };
@@ -1065,7 +1348,7 @@ export class App {
       const askOpen = this.dialog?.type === 'ask' && this.dialog.otherOpen && !this.approval;
       if (this.approval) return;
       if (this.dialog && !askOpen) return;
-      const pasted = key.text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const pasted = String(key.text ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
       if (askOpen) {
         const dialog = this.dialog;
         const text = dialog.otherText || '';
@@ -1073,8 +1356,10 @@ export class App {
         dialog.otherText = (text.slice(0, cur) + pasted.split('\n')[0] + text.slice(cur)).slice(0, 2_000);
         dialog.otherCursor = Math.min(dialog.otherText.length, cur + pasted.split('\n')[0].length);
         this.requestRender();
+      } else if (pasted) {
+        this.insertPastedText(pasted);
       } else {
-        this.insertText(pasted);
+        this.pasteFromClipboard({ preferImage: true });
       }
       return;
     }
@@ -1093,10 +1378,7 @@ export class App {
         return;
       }
       if (this.input) {
-        this.input = '';
-        this.cursor = 0;
-        this.suggestionIndex = 0;
-        this.requestRender();
+        this.clearComposer();
         return;
       }
       const now = Date.now();
@@ -1114,6 +1396,10 @@ export class App {
     }
     if (key.ctrl && key.text === 'l') {
       this.requestRender();
+      return;
+    }
+    if (key.ctrl && key.text === 'v') {
+      if (!this.approval) this.pasteFromClipboard();
       return;
     }
     if (this.approval) {
@@ -1138,10 +1424,7 @@ export class App {
         this.abortController?.abort();
         this.setFlash('Stopping…', 'warning');
       } else if (this.input) {
-        this.input = '';
-        this.cursor = 0;
-        this.suggestionIndex = 0;
-        this.requestRender();
+        this.clearComposer();
       }
       return;
     }
@@ -1197,29 +1480,41 @@ export class App {
       return;
     }
     if (key.name === 'backspace') {
-      const before = codePointBefore(this.input, this.cursor);
-      this.input = this.input.slice(0, before) + this.input.slice(this.cursor);
-      this.cursor = before;
+      const token = this.composerTokenAtEnd(this.cursor);
+      if (token) {
+        this.removeComposerToken(token);
+      } else {
+        const before = codePointBefore(this.input, this.cursor);
+        this.input = this.input.slice(0, before) + this.input.slice(this.cursor);
+        this.cursor = before;
+      }
+      this.pruneComposerAttachments();
       this.suggestionIndex = 0;
       this.requestRender();
       return;
     }
     if (key.name === 'delete') {
-      const after = codePointAfter(this.input, this.cursor);
-      this.input = this.input.slice(0, this.cursor) + this.input.slice(after);
+      const token = this.composerTokenAtStart(this.cursor);
+      if (token) {
+        this.removeComposerToken(token);
+      } else {
+        const after = codePointAfter(this.input, this.cursor);
+        this.input = this.input.slice(0, this.cursor) + this.input.slice(after);
+      }
+      this.pruneComposerAttachments();
       this.suggestionIndex = 0;
       this.requestRender();
       return;
     }
     if (key.name === 'left') {
       if (key.ctrl) this.cursor = this.lineStart(this.cursor);
-      else this.cursor = codePointBefore(this.input, this.cursor);
+      else this.cursor = this.composerPreviousIndex(this.cursor);
       this.requestRender();
       return;
     }
     if (key.name === 'right') {
       if (key.ctrl) this.cursor = this.lineEnd(this.cursor);
-      else this.cursor = codePointAfter(this.input, this.cursor);
+      else this.cursor = this.composerNextIndex(this.cursor);
       this.requestRender();
       return;
     }
@@ -1247,6 +1542,7 @@ export class App {
       const start = this.lineStart(this.cursor);
       this.input = this.input.slice(0, start) + this.input.slice(this.cursor);
       this.cursor = start;
+      this.pruneComposerAttachments();
       this.suggestionIndex = 0;
       this.requestRender();
       return;
@@ -1254,6 +1550,7 @@ export class App {
     if (key.ctrl && key.text === 'k') {
       const end = this.lineEnd(this.cursor);
       this.input = this.input.slice(0, this.cursor) + this.input.slice(end);
+      this.pruneComposerAttachments();
       this.suggestionIndex = 0;
       this.requestRender();
       return;
@@ -1265,6 +1562,15 @@ export class App {
     if (key.name === 'text' || key.name === 'char') {
       this.insertText(key.text);
     }
+  }
+
+  clearComposer() {
+    this.input = '';
+    this.cursor = 0;
+    this.suggestionIndex = 0;
+    this.composerScroll = 0;
+    this.composerAttachments.clear();
+    this.requestRender();
   }
 
   insertText(text) {
@@ -1303,10 +1609,20 @@ export class App {
     const column = layout.cursorCol;
     const targetStart = layout.lineStarts[to];
     const targetLimit = to + 1 < layout.lineStarts.length ? layout.lineStarts[to + 1] : this.input.length;
+    const tokens = new Map(this.composerTokens().map((token) => [token.start, token]));
+    const labels = this.composerTokenLabels();
     let index = targetStart;
     let visible = 0;
     while (index < targetLimit) {
       if (this.input[index] === '\n') break;
+      const token = tokens.get(index);
+      if (token) {
+        const width = visibleWidth(labels.get(token.id) || '');
+        if (visible + width > column) break;
+        visible += width;
+        index = token.end;
+        continue;
+      }
       const code = this.input.codePointAt(index);
       const length = code > 0xffff ? 2 : 1;
       const width = visibleWidth(this.input.slice(index, index + length));
@@ -1320,10 +1636,31 @@ export class App {
 
   deleteWord() {
     let index = this.cursor;
-    while (index > 0 && /\s/.test(this.input[index - 1])) index -= 1;
-    while (index > 0 && !/\s/.test(this.input[index - 1])) index -= 1;
+    const tokens = this.composerTokens();
+    const tokenBefore = (position) => tokens.find((token) => token.end === position || (position > token.start && position < token.end));
+    while (index > 0) {
+      const token = tokenBefore(index);
+      if (token) {
+        index = token.start;
+        break;
+      }
+      const before = codePointBefore(this.input, index);
+      if (!/\s/.test(this.input[before])) break;
+      index = before;
+    }
+    while (index > 0) {
+      const token = tokenBefore(index);
+      if (token) {
+        index = token.start;
+        break;
+      }
+      const before = codePointBefore(this.input, index);
+      if (/\s/.test(this.input[before])) break;
+      index = before;
+    }
     this.input = this.input.slice(0, index) + this.input.slice(this.cursor);
     this.cursor = index;
+    this.pruneComposerAttachments();
     this.suggestionIndex = 0;
     this.requestRender();
   }
@@ -1368,21 +1705,24 @@ export class App {
 
   submitInput() {
     const value = this.input;
+    if (!value.trim()) return;
+    const images = this.composerImages(value);
+    const text = this.expandComposerText(value);
     this.cursor = 0;
     this.suggestionIndex = 0;
     this.composerScroll = 0;
     // While gatita is working, everything you submit becomes steering text.
-    if (this.running && value.trim()) {
-      this.queueSteering(value);
+    if (this.running) {
+      this.queueSteering(text, { images });
       return;
     }
     // A pasted multi-line snippet that merely starts with / is not a command.
-    if (!value.includes('\n') && value.trim().startsWith('/')) {
-      this.input = '';
+    if (!value.includes('\n') && !this.composerTokens(value).length && value.trim().startsWith('/')) {
+      this.clearComposer();
       this.executeSlash(value.trim());
       return;
     }
-    this.sendPrompt(value);
+    this.sendPrompt(text, { images });
   }
 
   toggleLastTool() {
@@ -2088,29 +2428,60 @@ export class App {
     void this.copySelection(selection);
   }
 
-  pasteFromClipboard() {
-    this.clipboard.read().then((raw) => {
+  async pasteFromClipboard({ preferImage = false } = {}) {
+    let readError = null;
+    try {
+      const readImage = this.clipboard.readImage;
+      if (preferImage && typeof readImage === 'function') {
+        const image = await readImage();
+        if (image?.dataUrl) {
+          if (this.approval || this.dialog) {
+            this.setToast('Close the dialog first.', 'warning');
+            return;
+          }
+          this.attachImage({ ...image, name: 'pasted image' });
+          return;
+        }
+      }
+      let raw = '';
+      try {
+        raw = await this.clipboard.read();
+      } catch (error) {
+        readError = error;
+      }
       const text = String(raw || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      if (!text) {
-        this.setToast('Clipboard is empty.', 'warning');
+      if (text) {
+        const dialog = this.dialog;
+        if (dialog?.type === 'input') {
+          const capped = text.slice(0, 100_000);
+          dialog.value = dialog.value.slice(0, dialog.cursor) + capped + dialog.value.slice(dialog.cursor);
+          dialog.cursor += capped.length;
+          this.requestRender();
+          return;
+        }
+        if (this.approval || this.dialog) {
+          this.setToast('Close the dialog first.', 'warning');
+          return;
+        }
+        this.insertPastedText(text);
         return;
       }
-      const dialog = this.dialog;
-      if (dialog?.type === 'input') {
-        const capped = text.slice(0, 100_000);
-        dialog.value = dialog.value.slice(0, dialog.cursor) + capped + dialog.value.slice(dialog.cursor);
-        dialog.cursor += capped.length;
-        this.requestRender();
-        return;
+      if (!preferImage && typeof readImage === 'function') {
+        const image = await readImage();
+        if (image?.dataUrl) {
+          if (this.approval || this.dialog) {
+            this.setToast('Close the dialog first.', 'warning');
+            return;
+          }
+          this.attachImage({ ...image, name: 'pasted image' });
+          return;
+        }
       }
-      if (this.approval || this.dialog) {
-        this.setToast('Close the dialog first.', 'warning');
-        return;
-      }
-      this.insertText(text);
-    }).catch((error) => {
+      if (readError) throw readError;
+      this.setToast('Clipboard is empty.', 'warning');
+    } catch (error) {
       this.setToast(`Clipboard failed: ${error?.message || error}`, 'danger');
-    });
+    }
   }
 
   handleApprovalKey(key) {
@@ -2318,6 +2689,7 @@ export class App {
     clearTimeout(this.toastTimer);
     this.terminal.leave();
     this.registry?.cleanup?.();
+    this.tasks?.cleanup?.();
     this.mcp?.closeAll?.();
     this.store.close();
     if (this.donePromise) this.donePromise();
@@ -2498,9 +2870,10 @@ export class App {
     else if (this.dialog) left = s.fg('faint', '↑↓ select · enter confirm · esc close');
     else if (this.running) left = s.fg('warning', 'working · esc interrupt · ctrl+c cancel');
     else if (this.mode === 'plan') left = s.fg('warning', 'plan mode · enter send · /build starts');
-    else left = s.fg('faint', 'enter send · shift+enter newline · / commands · ctrl+c twice to quit');
+    else left = s.fg('faint', 'enter send · shift+enter newline · ctrl+v paste · / commands');
     const reasoning = this.model()?.reasoningLevels?.length ? ` · think ${reasoningLabel(this.reasoning)}` : '';
-    let right = `${this.model()?.name || this.modelId}${reasoning}`;
+    const goal = this.goal?.status === 'active' ? ' · goal' : '';
+    let right = `${this.model()?.name || this.modelId}${reasoning}${goal}`;
     if (this.scrollOffset > 0) right = `${GLYPHS.scrollUp} ${this.scrollOffset} · ${right}`;
     const content = this.fitRow(` ${left}`, `${s.fg('muted', right)} `, Math.max(10, cols));
     return s.bg('surface', padEndVisible(content, cols));
@@ -2530,6 +2903,7 @@ export class App {
     const inner = Math.max(8, cols - 2);
     const textWidth = Math.max(4, inner - 2);
     const inputLayout = this.layoutInput(this.input, this.cursor, textWidth);
+    const tokenLabels = this.composerTokenLabels(this.input);
     const maxLines = 5;
     const totalLines = inputLayout.lines.length;
     let top = this.composerScroll || 0;
@@ -2543,27 +2917,39 @@ export class App {
     if (totalLines > maxLines) {
       scrollHint = ` ${top + 1}-${top + visibleLines.length}/${totalLines}`;
     }
-    if (this.pendingImages.length) {
-      const images = `▣ ${this.pendingImages.length} image${this.pendingImages.length === 1 ? '' : 's'} attached · /image clear`;
-      lines.push(s.fg('info', truncateVisible(images, cols - 4)));
-    }
-    const topFill = Math.max(0, inner - visibleWidth(`${title}${scrollHint}`) - 3);
-    lines.push(`${s.fg('accent', '╭─')} ${s.fg('muted', `${title}${scrollHint}`)} ${s.fg('border', '─'.repeat(topFill))}${s.fg('accent', '╮')}`);
+    const titleText = truncateVisible(`${title}${scrollHint}`, Math.max(0, inner - 3));
+    const topFill = Math.max(0, inner - visibleWidth(titleText) - 3);
+    lines.push(`${s.fg('accent', '╭─')} ${s.fg('muted', titleText)} ${s.fg('border', '─'.repeat(topFill))}${s.fg('accent', '╮')}`);
     if (!visibleLines.length) visibleLines = [''];
     visibleLines.forEach((line, index) => {
       let content;
+      const lineStart = inputLayout.lineStarts[top + index] ?? 0;
+      const cursorInLine = index === cursorLine ? this.cursor : null;
+      const styledLine = truncateVisible(this.styleComposerLine(line, tokenLabels, cursorInLine, lineStart), textWidth);
+      const styledWidth = visibleWidth(styledLine);
+      const tokenAtCursor = index === cursorLine ? this.composerTokenAtStart(this.cursor) : null;
+      const tokenInLine = tokenAtCursor
+        && tokenAtCursor.start >= lineStart
+        && tokenAtCursor.start < lineStart + line.length;
       if (this.input === '' && index === 0) {
         const placeholder = this.running ? 'type to steer · enter to queue' : 'ask gatita to build something';
-        content = `${s.inverse(' ')} ${s.fg('faint', placeholder)}`;
+        content = `${s.inverse(' ')} ${s.fg('faint', truncateVisible(placeholder, Math.max(0, textWidth - 2)))}`;
+      } else if (tokenInLine) {
+        content = styledLine;
       } else if (index === cursorLine && !this.dialog) {
-        const cursorCol = Math.min(inputLayout.cursorCol, visibleWidth(line));
-        const before = sliceVisible(line, 0, cursorCol);
-        const rest = sliceVisible(line, cursorCol);
-        const cell = [...rest][0] || ' ';
-        const after = rest.slice(cell.length);
-        content = `${before}${s.inverse(cell)}${after}`;
+        const cursorCol = Math.min(inputLayout.cursorCol, styledWidth);
+        if (cursorCol >= textWidth && textWidth > 0) {
+          const before = sliceVisible(styledLine, 0, textWidth - 1);
+          const cell = stripAnsi(sliceVisible(styledLine, textWidth - 1, 1)) || ' ';
+          content = `${before}${s.inverse(cell)}`;
+        } else {
+          const before = sliceVisible(styledLine, 0, cursorCol);
+          const cell = stripAnsi(sliceVisible(styledLine, cursorCol, 1)) || ' ';
+          const after = sliceVisible(styledLine, cursorCol + 1);
+          content = `${before}${s.inverse(cell)}${after}`;
+        }
       } else {
-        content = s.fg(this.running ? 'text' : 'text', line);
+        content = s.fg('text', styledLine);
       }
       lines.push(`${s.fg('accent', '│')} ${padEndVisible(content, textWidth)} ${s.fg('accent', '│')}`);
     });
@@ -2881,7 +3267,10 @@ export class App {
     }
     if (this.steeringQueue.length) {
       for (const queued of this.steeringQueue) {
-        lines.push(`  ${s.fg('faint', '› queued: ')}${s.fg('muted', truncateVisible(queued, Math.max(8, width - 12)))}`);
+        const text = String(queued?.text ?? queued ?? '');
+        const imageCount = Array.isArray(queued?.images) ? queued.images.length : 0;
+        const suffix = imageCount ? ` · ${imageCount} image${imageCount === 1 ? '' : 's'}` : '';
+        lines.push(`  ${s.fg('faint', '› queued: ')}${s.fg('muted', truncateVisible(`${text}${suffix}`, Math.max(8, width - 12)))}`);
       }
     }
     return lines;
@@ -2903,7 +3292,8 @@ export class App {
         lines.push(`  ${s.bg('surface2', ` ${padEndVisible(line, innerWidth)} `)}`);
       }
       if (Array.isArray(message.meta?.images) && message.meta.images.length) {
-        lines.push(`  ${s.fg('info', `▣ ${message.meta.images.length} image${message.meta.images.length === 1 ? '' : 's'}`)}`);
+        const boxes = message.meta.images.map((_image, index) => s.bg('imageBg', s.bold(s.fg('image', `[Image ${index + 1}]`)))).join(' ');
+        lines.push(`  ${boxes}`);
       }
       return lines;
     }
@@ -2999,6 +3389,9 @@ export class App {
     if (name === 'websearch') return truncateToWidth(String(args.query || ''), 60);
     if (name === 'computer') return truncateToWidth(`${args.action || ''}${args.keys ? ` ${args.keys}` : ''}${args.x != null ? ` ${args.x},${args.y}` : ''}`, 60);
     if (name === 'todo') return Array.isArray(args.todos) ? `${args.todos.length} tasks` : 'read list';
+    if (name === 'goal') return truncateToWidth(String(args.action || 'status'), 60);
+    if (name === 'task_status') return args.task_id ? `check ${args.task_id}` : 'list background tasks';
+    if (name === 'stop_task') return `stop ${args.task_id || 'background task'}`;
     if (name === 'skill') return truncateToWidth(String(args.name || 'list'), 60);
     try {
       return truncateToWidth(JSON.stringify(args), 60);
@@ -3306,6 +3699,7 @@ export class App {
         'ctrl+t toggle work details · ctrl+r toggle thinking · m expand/minimize all thoughts',
         'type while gatita works and press enter — your message steers her after the next tool finishes',
         'tab complete · up/down move in the suggestion list · enter accepts it',
+        'ctrl+v or right click pastes text or an image · multi-line text collapses into a pasted-lines box',
         'esc interrupt · ctrl+c cancel or quit',
         'terminal bell plus a synthesized chime: once when gatita needs you and twice when done · /sound toggles',
         'drag with the left mouse button to select text — release to copy',
@@ -3313,7 +3707,6 @@ export class App {
         'gatita can ask multiple-choice questions (with an "other" option) — she keeps preparing safely while you answer',
         'multi-line selections are copied inside a markdown code fence',
         'double-click selects a word · triple-click selects a line',
-        'right click pastes the clipboard',
         'pageup/pagedown or mouse wheel scrolls · ctrl+o expand tool · m minimize/expand thoughts',
         'left click folders · recent chats · model/chat pickers · suggestion rows',
         'up/down history · ctrl+a/e line start/end',
@@ -3415,7 +3808,9 @@ export async function runTui({ args = [] } = {}) {
   let models;
   try {
     [me, models] = await Promise.all([
-      client.me({ timeoutMs: 15_000 }),
+      // ensureLogin already fetched the account when a saved session was
+      // valid. Reuse it so startup doesn't make the same request twice.
+      auth.source === 'login' ? client.me({ timeoutMs: 15_000 }) : auth.me,
       client.models({ timeoutMs: 15_000 }),
     ]);
   } catch (error) {

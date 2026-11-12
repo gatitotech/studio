@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { saveConfig } from '../config.js';
 import { clearStoredAuth } from '../authStore.js';
+import { bestEffortLogout } from '../commands.js';
 import { createStyler } from '../theme.js';
 import { writeClipboard } from '../clipboard.js';
 import { discoverMcpServers } from '../../mcp/discover.js';
@@ -25,6 +26,7 @@ export const SLASH_COMMANDS = [
   { name: 'usage', description: 'Show token usage and limits' },
   { name: 'plan', aliases: ['p'], description: 'Plan mode: ask first, then write a buildable plan' },
   { name: 'build', aliases: ['b'], description: 'Build mode: build the approved plan or send a normal prompt' },
+  { name: 'goal', description: 'Keep working until a goal is complete: /goal <task>, /goal stop' },
   { name: 'details', description: 'Show or hide work details in the transcript' },
   { name: 'reset', description: 'Use a banked reset to refill your limits' },
   { name: 'admin', description: 'Admin: reset usage or grant banked resets' },
@@ -444,10 +446,13 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
       if (!chat) return;
       if (!guardIdle(app, 'Wait for the current turn to finish.')) return;
       app.confirm(`Delete "${truncate(chat.title, 50)}" and its messages?`, () => {
+        const goalKey = typeof app.goalStoreKey === 'function' ? app.goalStoreKey(chat.id) : null;
+        if (goalKey) app.store.setSetting(goalKey, '');
         app.store.deleteChat(chat.id);
         app.chat = null;
         app.messages = [];
         app.todos = [];
+        app.goal = null;
         app.refreshSidebar();
         app.registry?.setChat(null);
         const next = app.store.recentChats(1)[0];
@@ -531,6 +536,58 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
       app.requestRender();
       if (typeof app.acceptPlan === 'function' && app.acceptPlan()) return;
       flash(app, 'Build mode on. No approved plan waiting; send a normal prompt.', 'info');
+      return;
+    }
+    case 'goal': {
+      const value = args.trim();
+      const lower = value.toLowerCase();
+      if (!value || lower === 'status') {
+        if (!app.goal) {
+          showText(app, 'goal', [
+            app.styler.fg('muted', 'No goal has been set for this chat.'),
+            '',
+            app.styler.fg('faint', 'Use /goal <task> to make Gatita keep working until it is complete.'),
+          ]);
+          return;
+        }
+        const statusColor = app.goal.status === 'complete' ? 'success' : app.goal.status === 'blocked' ? 'warning' : 'accent';
+        const elapsed = app.goal.startedAt ? ` · ${Math.max(0, Math.round(((app.goal.completedAt || app.goal.blockedAt || Date.now()) - app.goal.startedAt) / 1000))}s` : '';
+        const body = [
+          `${app.styler.fg(statusColor, app.goal.status)}${app.styler.fg('faint', elapsed)}`,
+          '',
+          app.goal.text,
+        ];
+        if (app.goal.summary) body.push('', app.styler.fg('muted', app.goal.summary));
+        if (app.goal.status === 'active') body.push('', app.styler.fg('faint', 'Use /goal stop to end it early.'));
+        showText(app, 'goal', body);
+        return;
+      }
+      if (['stop', 'clear', 'off', 'cancel', 'done'].includes(lower)) {
+        if (!guardIdle(app)) return;
+        if (!app.goal) {
+          flash(app, 'No goal is set.', 'muted');
+          return;
+        }
+        app.clearGoal();
+        flash(app, 'Goal cleared.', 'success');
+        return;
+      }
+      if (!guardIdle(app)) return;
+      if (!app.chat) {
+        const chat = app.newChat({
+          folderId: app.config.lastFolderId || null,
+          cwd: app.cwd,
+          startFresh: false,
+        });
+        if (!chat) return;
+      }
+      if (app.mode !== 'build') {
+        app.mode = 'build';
+        app.config.mode = 'build';
+        saveConfig(app.config);
+      }
+      app.setGoal(value);
+      await app.sendPrompt(value);
       return;
     }
     case 'details':
@@ -699,10 +756,13 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
     }
     case 'image': {
       const value = args.trim();
-      if (!value || value === 'clear') {
-        app.pendingImages = [];
-        app.requestRender();
-        flash(app, value === 'clear' ? 'Images cleared.' : 'Usage: /image <path> or /image clear.', value === 'clear' ? 'success' : 'muted');
+      if (!value) {
+        flash(app, 'Usage: /image <path> or /image clear.', 'muted');
+        return;
+      }
+      if (value === 'clear' || value === 'reset') {
+        const removed = app.clearComposerImages();
+        flash(app, removed ? `Cleared ${removed} image${removed === 1 ? '' : 's'}.` : 'No images attached.', removed ? 'success' : 'muted');
         return;
       }
       const raw = value.replace(/^['"]|['"]$/g, '').replace(/^~(?=$|[\\/])/, os.homedir());
@@ -716,14 +776,7 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
         }
         const mediaType = mimeFor(file);
         const dataUrl = `data:${mediaType};base64,${fs.readFileSync(file).toString('base64')}`;
-        app.pendingImages.push({ path: file, mediaType, dataUrl });
-        app.requestRender();
-        const model = app.model();
-        if (model && !model.vision) {
-          flash(app, `Attached ${path.basename(file)}. ${model.name} cannot read images; switch with /model.`, 'warning');
-        } else {
-          flash(app, `Attached ${path.basename(file)}.`, 'success');
-        }
+        app.attachImage({ path: file, name: path.basename(file), mediaType, dataUrl });
       } catch {
         flash(app, `Image not found: ${file}`, 'danger');
       }
@@ -776,8 +829,10 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
     }
     case 'logout': {
       app.confirm('Sign out of Gatita Studio?', async () => {
-        await app.client.logout().catch(() => {});
+        const client = app.client;
         clearStoredAuth(app.config.serverUrl);
+        app.setFlash('Signed out.', 'success');
+        await bestEffortLogout(client);
         app.quit();
       });
       return;

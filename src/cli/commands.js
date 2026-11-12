@@ -26,25 +26,18 @@ function color(hex, text) {
   return stdout.isTTY ? styler.fg(hex, text) : String(text);
 }
 
-async function ask(question, fallback = '') {
+async function readLineWithReadline(prompt) {
   const rl = readline.createInterface({ input: stdin, output: stdout });
   try {
-    const answer = await rl.question(question);
-    return answer.trim() || fallback;
+    return await rl.question(prompt);
   } finally {
     rl.close();
   }
 }
 
-export async function readSecret(prompt) {
-  if (!stdin.isTTY) {
-    const rl = readline.createInterface({ input: stdin, output: stdout });
-    try {
-      return (await rl.question(prompt)).trim();
-    } finally {
-      rl.close();
-    }
-  }
+async function readLine(prompt, { secret = false } = {}) {
+  if (!stdin.isTTY) return (await readLineWithReadline(prompt)).trim();
+
   return new Promise((resolve, reject) => {
     let value = '';
     let done = false;
@@ -67,7 +60,17 @@ export async function readSecret(prompt) {
     };
     const onData = (chunk) => {
       const text = String(chunk);
-      for (const char of text) {
+      for (let index = 0; index < text.length; index += 1) {
+        const char = text[index];
+        if (char === '\u001b') {
+          // Drop arrow keys and other escape sequences instead of typing them.
+          index += 1;
+          if (text[index] === '[' || text[index] === 'O') {
+            while (index + 1 < text.length && /[0-9;]/.test(text[index + 1])) index += 1;
+            index += 1;
+          }
+          continue;
+        }
         if (char === '\r' || char === '\n') {
           finish();
           return;
@@ -76,6 +79,13 @@ export async function readSecret(prompt) {
           finish(new Error('Cancelled'));
           return;
         }
+        if (char === '\u0004') {
+          if (!value) {
+            finish(new Error('Cancelled'));
+            return;
+          }
+          continue;
+        }
         if (char === '\u007f' || char === '\b') {
           if (value.length) {
             value = value.slice(0, -1);
@@ -83,23 +93,35 @@ export async function readSecret(prompt) {
           }
           continue;
         }
-        if (char >= ' ' && char !== '\u007f') {
+        if (char >= ' ') {
           value += char;
-          stdout.write('•');
+          stdout.write(secret ? '•' : char);
         }
       }
     };
-    stdout.write(prompt);
+    stdin.setEncoding('utf8');
+    // Attach the handler before enabling raw mode so keys typed while the
+    // sign-in banner was still printing are delivered instead of waiting
+    // for another Enter.
+    stdin.on('data', onData);
     try {
       stdin.setRawMode(true);
     } catch {
-      finish(new Error('This terminal cannot hide password input.'));
+      finish(new Error('This terminal cannot read input.'));
       return;
     }
+    stdout.write(prompt);
     stdin.resume();
-    stdin.setEncoding('utf8');
-    stdin.on('data', onData);
   });
+}
+
+async function ask(question, fallback = '') {
+  const answer = await readLine(question);
+  return answer.trim() || fallback;
+}
+
+export async function readSecret(prompt) {
+  return readLine(prompt, { secret: true });
 }
 
 function printSignInBanner(config) {
@@ -140,7 +162,7 @@ export async function ensureLogin({ config = loadConfig(), force = false } = {})
     const client = createApiClient({ serverUrl: config.serverUrl, token });
     try {
       const me = await client.me({ timeoutMs: 10_000 });
-      return { client, me, config };
+      return { client, me, config, source: 'session' };
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         clearStoredAuth(config.serverUrl);
@@ -158,6 +180,7 @@ export async function ensureLogin({ config = loadConfig(), force = false } = {})
     if (!password) continue;
     const client = createApiClient({ serverUrl: config.serverUrl, token: '' });
     try {
+      console.log(color('muted', 'Signing in…'));
       const payload = await client.login(email, password);
       saveStoredAuth(config.serverUrl, {
         token: payload.token,
@@ -169,7 +192,7 @@ export async function ensureLogin({ config = loadConfig(), force = false } = {})
       config.defaultModel = config.defaultModel || payload.server?.defaultModel;
       saveConfig(config);
       console.log(color('success', `Signed in as ${payload.user?.displayName || email} on ${payload.plan?.displayName || 'Free'}.`));
-      return { client, me: payload, config };
+      return { client, me: payload, config, source: 'login' };
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Could not reach the server.';
       console.error(color('danger', message));
@@ -346,25 +369,29 @@ export async function runSkillsCommand() {
 
 export async function runLogin() {
   const config = loadConfig();
-  const { me, client } = await ensureLogin({ config, force: true });
-  const models = await client.models().catch(() => null);
+  const { me } = await ensureLogin({ config, force: true });
   console.log(color('muted', `Server: ${config.serverUrl}`));
-  if (models?.data) {
-    console.log(color('muted', `${models.data.length} Gatita models available. Default: ${models.defaultModel}.`));
-  }
   console.log(color('muted', `Session saved to ${filePaths().auth}`));
   return me;
+}
+
+export function bestEffortLogout(client) {
+  if (!client) return Promise.resolve();
+  const timeout = new Promise((resolve) => {
+    setTimeout(resolve, 1_000).unref?.();
+  });
+  return Promise.race([client.logout({ timeoutMs: 1_000 }).catch(() => {}), timeout]);
 }
 
 export async function runLogout() {
   const config = loadConfig();
   const token = authToken(config.serverUrl);
-  if (token) {
-    const client = createApiClient({ serverUrl: config.serverUrl, token });
-    await client.logout().catch(() => {});
-  }
+  const client = token ? createApiClient({ serverUrl: config.serverUrl, token }) : null;
+  // Drop the local session first. The server call is only cleanup; it should
+  // never keep someone waiting to get their terminal back.
   clearStoredAuth(config.serverUrl);
   console.log('Signed out.');
+  await bestEffortLogout(client);
 }
 
 export async function runModels() {
@@ -494,8 +521,6 @@ export function printHelp() {
   console.log(`  ${color('text', 'gatita-studio skills')} ${color('muted', '           list installed skills')}`);
   console.log(`  ${color('text', 'gatita-studio update')} ${color('muted', '          check for and install updates')}`);
   console.log(`  ${color('text', 'gatita-studio doctor')} ${color('muted', '          check the install')}`);
-  console.log('');
-  console.log(color('muted', 'Environment: GATITA_STUDIO_TOKEN, GATITA_STUDIO_HOME, GATITA_NO_ANIMATION'));
 }
 
 export async function runUpdate() {

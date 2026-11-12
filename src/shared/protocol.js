@@ -6,7 +6,7 @@ export const DEFAULT_STUDIO_PATH = '/studio';
 export const DEFAULT_SERVER_URL = `https://api.gatita.tech${DEFAULT_STUDIO_PATH}`;
 
 export const CLIENT_NAME = 'gatita-studio';
-export const CLIENT_VERSION = '1.0.0-rc-1';
+export const CLIENT_VERSION = '1.0.0';
 export const USER_AGENT = `${CLIENT_NAME}/${CLIENT_VERSION}`;
 
 export const EVENT = Object.freeze({

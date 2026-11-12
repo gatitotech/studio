@@ -15,6 +15,10 @@ export const PALETTES = {
     warning: '#e6c06a',
     danger: '#e06c75',
     info: '#86b9d8',
+    image: '#c9a2e8',
+    imageBg: '#2b2235',
+    paste: '#f0a45c',
+    pasteBg: '#33271c',
   },
   paper: {
     ink: '#f4f0e8',
@@ -30,6 +34,10 @@ export const PALETTES = {
     warning: '#8a6416',
     danger: '#b23a44',
     info: '#2f6b8a',
+    image: '#70448f',
+    imageBg: '#ebe0f4',
+    paste: '#94550f',
+    pasteBg: '#f3e3cd',
   },
 };
 
