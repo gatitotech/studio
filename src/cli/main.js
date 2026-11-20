@@ -2,6 +2,7 @@ import { CLIENT_VERSION } from '../shared/protocol.js';
 
 const CLIENT_COMMANDS = new Set([
   'tui',
+  'serve',
   'doctor',
   'login',
   'logout',
@@ -33,6 +34,12 @@ export function parseArgs(argv) {
 export async function runClient(argv = process.argv.slice(2)) {
   const { command, rest } = parseArgs(argv);
 
+  if (command === 'serve') {
+    console.error('gatita-studio: the Studio server is not included in this client package.');
+    console.error('The server runs on the Gatita host; this package ships the client only.');
+    process.exitCode = 1;
+    return;
+  }
   if (command === 'doctor') {
     const { runDoctorCommand } = await import('./commands.js');
     await runDoctorCommand();

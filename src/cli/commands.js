@@ -4,7 +4,7 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { loadConfig, saveConfig } from './config.js';
-import { authToken, clearStoredAuth, getStoredAuth, maskToken, saveStoredAuth } from './authStore.js';
+import { authToken, clearStoredAuth, getStoredAuth, maskToken, readAuthFile, saveStoredAuth } from './authStore.js';
 import { createApiClient, ApiError } from './api.js';
 import { openLocalStore } from './store.js';
 import { loadSkills } from '../skills/index.js';
@@ -12,18 +12,34 @@ import { loadPlugins } from '../plugins/index.js';
 import { loadMcpConfig, createMcpManager } from '../mcp/index.js';
 import { discoverMcpServers } from '../mcp/discover.js';
 import { filePaths } from './paths.js';
-import { createStyler } from './theme.js';
+import { createStyler, GLYPHS, padEndVisible, truncateVisible, visibleWidth } from './theme.js';
 import { COMPUTER_HELPER_PATH } from '../computer/index.js';
-import { roundedBox } from './tui/render.js';
-import { formatDuration, formatTokens, formatDateTime, plural } from '../shared/util.js';
+import { progressBar, roundedBox } from './tui/render.js';
+import { runInteractiveLogin } from './tui/login.js';
+import { readClipboard } from './clipboard.js';
+import { formatDuration, formatTokens, plural } from '../shared/util.js';
 import { CLIENT_VERSION } from '../shared/protocol.js';
-import { checkForUpdate, downloadUpdate, installTarball, isOutOfDate, formatUpdateNotice } from './update.js';
+import { checkForUpdate, downloadUpdate, installTarball, formatUpdateNotice } from './update.js';
+
+function activeStyler(theme = 'dark') {
+  return createStyler(theme, { enabled: Boolean(stdout.isTTY) });
+}
 
 const styler = createStyler('dark');
-const GLYPH_CAT = 'ᓚᘏᗢ';
 
 function color(hex, text) {
   return stdout.isTTY ? styler.fg(hex, text) : String(text);
+}
+
+function cliWidth(max = 76) {
+  return Math.max(44, Math.min(max, (stdout.columns || max) - 4));
+}
+
+function printHeader(title, subtitle = '', theme = 'dark') {
+  const s = activeStyler(theme);
+  console.log();
+  const badge = subtitle ? `  ${s.pill('accent', 'accentBg', subtitle, { isBold: true })}` : '';
+  console.log(`  ${s.fg('accent', GLYPHS.cat)}  ${s.bold(s.fg('text', title))}${badge}`);
 }
 
 async function readLineWithReadline(prompt) {
@@ -63,7 +79,6 @@ async function readLine(prompt, { secret = false } = {}) {
       for (let index = 0; index < text.length; index += 1) {
         const char = text[index];
         if (char === '\u001b') {
-          // Drop arrow keys and other escape sequences instead of typing them.
           index += 1;
           if (text[index] === '[' || text[index] === 'O') {
             while (index + 1 < text.length && /[0-9;]/.test(text[index + 1])) index += 1;
@@ -100,9 +115,6 @@ async function readLine(prompt, { secret = false } = {}) {
       }
     };
     stdin.setEncoding('utf8');
-    // Attach the handler before enabling raw mode so keys typed while the
-    // sign-in banner was still printing are delivered instead of waiting
-    // for another Enter.
     stdin.on('data', onData);
     try {
       stdin.setRawMode(true);
@@ -126,37 +138,57 @@ export async function readSecret(prompt) {
 
 function printSignInBanner(config) {
   if (!stdout.isTTY) {
-    console.log(color('accent', `${'ᓚᘏᗢ'} Gatita Studio`));
+    console.log(color('accent', `${GLYPHS.cat} Gatita Studio v${CLIENT_VERSION}`));
     console.log(color('muted', 'Sign in with your Gatita account.'));
     console.log(color('faint', `server: ${config.serverUrl}`));
     return;
   }
-  const styler = createStyler('dark', { enabled: true });
-  const width = Math.max(34, Math.min(54, stdout.columns || 54));
+  const s = createStyler(config.theme || 'dark', { enabled: true });
+  const width = Math.max(36, Math.min(56, (stdout.columns || 56) - 4));
   console.log();
-  console.log(`${styler.fg('accent', GLYPH_CAT)}  ${styler.bold(styler.fg('text', 'GATITA STUDIO'))}`);
-  console.log(styler.fg('muted', '  Your terminal. Her territory.'));
+  console.log(`  ${s.fg('accent', GLYPHS.cat)}  ${s.bold(s.fg('text', 'G A T I T A   S T U D I O'))}  ${s.fg('faint', `v${CLIENT_VERSION}`)}`);
+  console.log(`     ${s.fg('muted', 'Your terminal. Her territory.')}`);
   console.log();
   const box = roundedBox({
     width,
-    styler,
+    styler: s,
     title: 'sign in',
     padding: 1,
     background: 'surface',
     borderColor: 'accent',
     lines: [
-      styler.fg('text', 'Welcome back.'),
+      s.fg('text', 'Welcome back.'),
       '',
-      `${styler.fg('faint', 'server')}  ${styler.fg('muted', config.serverUrl)}`,
-      `${styler.fg('faint', 'models')}  ${styler.fg('muted', 'Gatita Fast · Gatita Max · Gatita Aura')}`,
-      `${styler.fg('faint', 'session')} ${styler.fg('muted', 'saved to this machine')}`,
+      `${s.fg('faint', 'server ')} ${s.fg('muted', config.serverUrl)}`,
+      `${s.fg('faint', 'models ')} ${s.fg('muted', 'Gatita Fast · Gatita Max · Gatita Aura')}`,
+      `${s.fg('faint', 'session')} ${s.fg('muted', 'saved securely to this machine')}`,
     ],
   });
   for (const line of box) console.log(`  ${line}`);
   console.log();
 }
 
-export async function ensureLogin({ config = loadConfig(), force = false } = {}) {
+export async function ensureLogin({
+  config = loadConfig(),
+  force = false,
+  initialEmail = '',
+  initialMode = 'credentials',
+  tokenOverride = '',
+} = {}) {
+  const directToken = String(tokenOverride || '').trim();
+  if (directToken) {
+    const client = createApiClient({ serverUrl: config.serverUrl, token: directToken });
+    const me = await client.me({ timeoutMs: 15_000 });
+    saveStoredAuth(config.serverUrl, {
+      token: directToken,
+      expiresAt: null,
+      email: me?.user?.email || '',
+      displayName: me?.user?.displayName || '',
+      plan: me?.plan?.id || me?.user?.plan || 'free',
+    });
+    return { client, me, config, source: 'session' };
+  }
+
   let token = force ? '' : authToken(config.serverUrl);
   if (token) {
     const client = createApiClient({ serverUrl: config.serverUrl, token });
@@ -172,9 +204,25 @@ export async function ensureLogin({ config = loadConfig(), force = false } = {})
     }
   }
 
+  const savedEntry = readAuthFile().servers?.[String(config.serverUrl)] || null;
+  const prefillEmail = String(initialEmail || savedEntry?.email || '').trim();
+
+  if (stdin.isTTY && stdout.isTTY && process.env.GATITA_SIMPLE_LOGIN !== '1') {
+    return runInteractiveLogin({
+      config,
+      createClient: createApiClient,
+      saveAuth: saveStoredAuth,
+      saveUserConfig: saveConfig,
+      initialEmail: prefillEmail,
+      initialMode,
+      readClipboard,
+    });
+  }
+
   printSignInBanner(config);
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const email = await ask('Email: ');
+    const emailPrompt = prefillEmail ? `Email [${prefillEmail}]: ` : 'Email: ';
+    const email = await ask(emailPrompt, prefillEmail);
     if (!email) continue;
     const password = await readSecret('Password: ');
     if (!password) continue;
@@ -249,24 +297,25 @@ export async function runMcpCommand(rest = []) {
   const command = String(sub || 'list').toLowerCase();
   const config = loadConfig();
   const paths = filePaths();
+  const s = activeStyler(config.theme);
 
   if (command === 'discover') {
-    console.log(color('muted', 'Probing localhost for MCP servers…'));
+    console.log(s.fg('muted', 'Probing localhost for MCP servers…'));
     const found = await discoverMcpServers({});
     if (!found.http.length && !found.processes.length) {
       console.log('No running MCP servers found on localhost.');
-      console.log(color('muted', 'Start one (for example with npx -y @modelcontextprotocol/server-filesystem .) and run this again.'));
+      console.log(s.fg('muted', 'Start one (for example with npx -y @modelcontextprotocol/server-filesystem .) and run this again.'));
       return;
     }
     for (const hit of found.http) {
       const label = hit.serverName ? `${hit.serverName}${hit.serverVersion ? ` ${hit.serverVersion}` : ''}` : 'unknown server';
-      console.log(`  ${color('success', '●')} ${hit.url} ${color('muted', `— ${label}`)}`);
+      console.log(`  ${s.fg('success', '●')} ${hit.url} ${s.fg('muted', `· ${label}`)}`);
     }
     for (const proc of found.processes) {
-      console.log(`  ${color('info', '◇')} pid ${proc.pid} ${color('faint', proc.commandLine)}`);
+      console.log(`  ${s.fg('info', '◇')} pid ${proc.pid} ${s.fg('faint', proc.commandLine)}`);
     }
     console.log('');
-    console.log(color('muted', 'Attach one with:'));
+    console.log(s.fg('muted', 'Attach one with:'));
     console.log('  gst mcp add <name> --url http://127.0.0.1:8000/mcp');
     return;
   }
@@ -290,12 +339,12 @@ export async function runMcpCommand(rest = []) {
         env: parseKeyValues(flags.env),
         headers: parseKeyValues(flags.header),
       }, { scope: flags.scope === 'project' ? 'project' : 'global' });
-      console.log(color('success', `Connected to ${result.name}: ${result.tools.length} tool(s).`));
-      for (const tool of result.tools) console.log(`    ${color('faint', tool)}`);
-      if (result.file) console.log(color('muted', `Saved to ${result.file}.`));
-      if (result.warning) console.log(color('warning', result.warning));
+      console.log(s.fg('success', `${GLYPHS.checked} Connected to ${result.name}: ${result.tools.length} tool(s).`));
+      for (const tool of result.tools) console.log(`    ${s.fg('faint', tool)}`);
+      if (result.file) console.log(s.fg('muted', `Saved to ${result.file}.`));
+      if (result.warning) console.log(s.fg('warning', result.warning));
     } catch (error) {
-      console.error(color('danger', error?.message || String(error)));
+      console.error(s.fg('danger', error?.message || String(error)));
       process.exitCode = 1;
     } finally {
       manager.closeAll();
@@ -313,11 +362,11 @@ export async function runMcpCommand(rest = []) {
     const manager = createMcpManager({ cwd: process.cwd(), config });
     try {
       const result = manager.removeServer(name);
-      console.log(color('success', `Removed ${result.name}.`));
-      if (result.removedFrom.length) console.log(color('muted', `Was in: ${result.removedFrom.join(', ')}`));
-      else console.log(color('muted', 'It was not configured anywhere.'));
+      console.log(s.fg('success', `${GLYPHS.checked} Removed ${result.name}.`));
+      if (result.removedFrom.length) console.log(s.fg('muted', `Was in: ${result.removedFrom.join(', ')}`));
+      else console.log(s.fg('muted', 'It was not configured anywhere.'));
     } catch (error) {
-      console.error(color('danger', error?.message || String(error)));
+      console.error(s.fg('danger', error?.message || String(error)));
       process.exitCode = 1;
     } finally {
       manager.closeAll();
@@ -330,48 +379,92 @@ export async function runMcpCommand(rest = []) {
   try {
     await manager.connectAll();
     const status = manager.status();
+    printHeader('MCP SERVERS', `${status.servers.length} connected`, config.theme);
+    console.log();
     if (!status.servers.length && !status.errors.length) {
-      console.log('No MCP servers configured.');
-      console.log(color('muted', `Add one with "gst mcp add <name> --url <url>" or edit ${path.join(paths.home, 'mcp.json')} (a premade example ships with it).`));
-      console.log(color('muted', 'Tip: "gst mcp discover" probes this machine for running servers.'));
+      console.log(`  ${s.fg('muted', 'No MCP servers configured.')}`);
+      console.log(`  ${s.fg('faint', `Add one with "gst mcp add <name> --url <url>" or edit ${path.join(paths.home, 'mcp.json')}.`)}`);
+      console.log(`  ${s.fg('faint', 'Tip: "gst mcp discover" probes this machine for running servers.')}`);
+      console.log();
       return;
     }
     for (const server of status.servers) {
-      console.log(`  ${color('success', '●')} ${server.name} ${color('muted', `${server.tools} tool(s)${server.version ? ` · ${server.version}` : ''}`)}`);
-      for (const tool of server.toolNames || []) console.log(`    ${color('faint', tool)}`);
+      console.log(`  ${s.fg('success', '●')} ${s.bold(s.fg('text', server.name))} ${s.fg('muted', `${server.tools} tool(s)${server.version ? ` · ${server.version}` : ''}`)}`);
+      for (const tool of server.toolNames || []) console.log(`    ${s.fg('faint', tool)}`);
     }
     for (const error of status.errors) {
-      console.log(`  ${color('danger', '✗')} ${error.server} ${color('faint', error.message)}`);
+      console.log(`  ${s.fg('danger', '✗')} ${s.fg('text', error.server)} ${s.fg('faint', error.message)}`);
     }
-    console.log(color('muted', 'Tools appear in the app as mcp__<server>__<tool> and ask for approval.'));
+    console.log();
+    console.log(`  ${s.fg('faint', 'Tools appear in the app as mcp__<server>__<tool> and ask for approval.')}`);
+    console.log();
   } finally {
     manager.closeAll();
   }
 }
 
 export async function runSkillsCommand() {
+  const config = loadConfig();
+  const s = activeStyler(config.theme);
   const skills = loadSkills({ cwd: process.cwd() });
   const home = filePaths().home;
+  printHeader('SKILLS', `${skills.length} installed`, config.theme);
+  console.log();
   if (!skills.length) {
-    console.log('No skills installed.');
-    console.log(color('muted', `Global skills live in ${path.join(home, 'skills')} — a premade example is there already.`));
-    console.log(color('muted', 'Copy ~/.gatita-studio/skills/example to a new folder and edit SKILL.md.'));
+    console.log(`  ${s.fg('muted', 'No skills installed yet.')}`);
+    console.log(`  ${s.fg('faint', `Global skills live in ${path.join(home, 'skills')} (a premade example ships there).`)}`);
+    console.log(`  ${s.fg('faint', 'Copy ~/.gatita-studio/skills/example to a new folder and edit SKILL.md.')}`);
+    console.log();
     return;
   }
-  console.log(`${color('accent', 'Skills')} ${color('faint', `· global folder: ${path.join(home, 'skills')}`)}`);
   for (const skill of skills) {
-    console.log(`  ${color('accent', skill.name)} ${color('faint', `(${skill.source})`)}`);
-    if (skill.description) console.log(`    ${color('muted', skill.description)}`);
+    console.log(`  ${s.fg('accent', GLYPHS.spark)} ${s.bold(s.fg('text', skill.name))} ${s.fg('faint', `(${skill.source})`)}`);
+    if (skill.description) console.log(`    ${s.fg('muted', skill.description)}`);
   }
-  console.log('');
-  console.log(color('muted', 'Mention a skill with @name in the composer, or ask gatita to use it.'));
+  console.log();
+  console.log(`  ${s.fg('faint', 'Mention a skill with @name in the composer, or ask Gatita to use it.')}`);
+  console.log();
 }
 
-export async function runLogin() {
+export async function runLogin(rest = []) {
   const config = loadConfig();
-  const { me } = await ensureLogin({ config, force: true });
-  console.log(color('muted', `Server: ${config.serverUrl}`));
-  console.log(color('muted', `Session saved to ${filePaths().auth}`));
+  let initialEmail = '';
+  let tokenOverride = '';
+  let initialMode = 'credentials';
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i];
+    if (arg === '--email' && rest[i + 1]) initialEmail = rest[++i];
+    else if (arg === '--token' && rest[i + 1]) tokenOverride = rest[++i];
+    else if (arg === '--key' || arg === '--api-key') initialMode = 'token';
+  }
+  const { me } = await ensureLogin({ config, force: true, initialEmail, initialMode, tokenOverride });
+  const s = activeStyler(config.theme);
+  const who = me?.user?.displayName || me?.user?.email || 'your account';
+  const plan = me?.plan?.displayName || 'Free';
+  if (stdout.isTTY) {
+    const box = roundedBox({
+      width: cliWidth(60),
+      styler: s,
+      title: 'session active',
+      borderColor: 'success',
+      titleColor: 'success',
+      lines: [
+        `${s.fg('success', GLYPHS.checked)} ${s.bold(s.fg('text', who))}  ${s.pill('accent', 'accentBg', plan.replace(/^Gatita\s+/i, '').toUpperCase(), { isBold: true })}`,
+        '',
+        `${s.fg('faint', 'server ')} ${s.fg('muted', config.serverUrl)}`,
+        `${s.fg('faint', 'saved  ')} ${s.fg('muted', filePaths().auth)}`,
+        '',
+        s.fg('faint', 'Run "gst" or "gatita-studio" to open Gatita Studio.'),
+      ],
+    });
+    console.log();
+    for (const line of box) console.log(`  ${line}`);
+    console.log();
+  } else {
+    console.log(s.fg('success', `Signed in as ${who} on ${plan}.`));
+    console.log(s.fg('muted', `Server: ${config.serverUrl}`));
+    console.log(s.fg('muted', `Session saved to ${filePaths().auth}`));
+  }
   return me;
 }
 
@@ -385,58 +478,110 @@ export function bestEffortLogout(client) {
 
 export async function runLogout() {
   const config = loadConfig();
+  const s = activeStyler(config.theme);
   const token = authToken(config.serverUrl);
   const client = token ? createApiClient({ serverUrl: config.serverUrl, token }) : null;
-  // Drop the local session first. The server call is only cleanup; it should
-  // never keep someone waiting to get their terminal back.
   clearStoredAuth(config.serverUrl);
-  console.log('Signed out.');
+  console.log(`${s.fg('success', GLYPHS.checked)} Signed out.`);
   await bestEffortLogout(client);
 }
 
 export async function runModels() {
   const config = loadConfig();
+  const s = activeStyler(config.theme);
   const { client, me } = await ensureLogin({ config });
   const payload = await client.models();
-  const plan = payload.plan?.displayName || me?.plan?.displayName || 'Free';
-  console.log(`${color('accent', 'Gatita models')} ${color('faint', `· ${plan}`)}`);
+  const plan = (payload.plan?.displayName || me?.plan?.displayName || 'Free').replace(/^Gatita\s+/i, '');
+  printHeader('GATITA MODELS', plan.toUpperCase(), config.theme);
+  console.log();
+  const lines = [];
   for (const model of payload.data) {
+    const active = model.id === config.defaultModel;
+    const marker = active ? s.fg('accent', GLYPHS.active) : s.fg('faint', GLYPHS.pending);
     const badges = [
-      model.available ? '' : color('warning', `locked (${model.requiredPlan})`),
-      model.tools ? color('muted', 'tools') : color('faint', 'chat'),
-      model.vision ? color('info', 'vision') : '',
-      model.reasoningLevels.length ? color('accent2', `reasoning: ${model.reasoningLevels.join('/')}`) : '',
-      model.default ? color('success', 'default') : '',
-    ].filter(Boolean).join('  ');
+      model.available ? '' : s.pill('warning', 'warningBg', `needs ${model.requiredPlan}`),
+      model.tools ? s.pill('muted', 'surface2', 'tools') : s.pill('faint', 'surface2', 'chat'),
+      model.vision ? s.pill('info', 'infoBg', 'vision') : '',
+      model.reasoningLevels.length ? s.pill('accent2', 'accent2Bg', `think ${model.reasoningLevels.join('/')}`) : '',
+      model.default ? s.pill('success', 'successBg', 'default') : '',
+    ].filter(Boolean).join(' ');
     const context = `${formatTokens(model.contextWindow)} ctx`;
-    console.log(`  ${model.id === config.defaultModel ? color('accent', '›') : ' '} ${color('text', model.name.padEnd(18))} ${color('faint', context.padEnd(12))} ${badges}`);
-    console.log(`    ${color('muted', model.description)}`);
+    lines.push(`${marker} ${s.bold(s.fg(active ? 'accent' : 'text', padEndVisible(model.name, 16)))} ${s.fg('faint', context.padEnd(10))} ${badges}`);
+    lines.push(`  ${s.fg('muted', model.description)}`);
+    lines.push('');
+  }
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  if (stdout.isTTY) {
+    const box = roundedBox({
+      width: cliWidth(78),
+      styler: s,
+      title: 'catalog',
+      subtitle: `${payload.data.length} models`,
+      footer: 'switch anytime in the TUI with /model',
+      borderColor: 'border',
+      lines,
+    });
+    for (const line of box) console.log(`  ${line}`);
+    console.log();
+  } else {
+    for (const line of lines) console.log(`  ${line}`);
   }
 }
 
 export async function runUsage() {
   const config = loadConfig();
+  const s = activeStyler(config.theme);
   const { client } = await ensureLogin({ config });
   const report = await client.usage(30);
-  console.log(`${color('accent', 'Usage')} ${color('faint', `· ${report.plan?.displayName || 'Free'}`)}`);
+  const plan = (report.plan?.displayName || 'Free').replace(/^Gatita\s+/i, '');
+  printHeader('USAGE', plan.toUpperCase(), config.theme);
+  console.log();
+  const lines = [];
   for (const window of report.windows || []) {
-    const width = 24;
-    const filled = Math.round((window.percent / 100) * width);
-    const bar = `${color('accent', '█'.repeat(filled))}${color('faint', '░'.repeat(width - filled))}`;
+    const pct = Math.max(0, Math.min(100, Number(window.percent) || 0));
+    const barColor = pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : 'accent';
+    const bar = progressBar(pct, 24, s, barColor);
     const reset = window.resetAt ? `resets in ${formatDuration(Math.max(0, window.resetAt - Date.now()), { compact: true })}` : 'no reset scheduled';
-    console.log(`  ${window.label.padEnd(8)} ${bar} ${formatTokens(window.used)} / ${formatTokens(window.limit)}  ${color('muted', reset)}`);
+    lines.push(`${s.bold(s.fg('text', window.label.padEnd(8)))} ${bar}  ${s.fg('text', formatTokens(window.used))} ${s.fg('faint', '/')} ${s.fg('muted', formatTokens(window.limit))}`);
+    lines.push(`         ${s.fg('faint', `${pct.toFixed(pct < 10 ? 1 : 0)}% used · ${reset}`)}`);
   }
-  console.log(`  ${color('muted', `Last 30 days: ${formatTokens(report.totals.tokens)} tokens across ${plural(report.totals.requests, 'request')}.`)}`);
-  for (const model of (report.models || []).slice(0, 8)) {
-    console.log(`    ${color('muted', model.modelId.padEnd(18))} ${formatTokens(model.tokens).padStart(8)}  ${plural(model.requests, 'request')}`);
+  if (report.bankedResets?.count > 0) {
+    lines.push('');
+    lines.push(`${s.fg('accent', GLYPHS.diamond)} ${s.fg('text', `${report.bankedResets.count} banked reset${report.bankedResets.count === 1 ? '' : 's'} available`)} ${s.fg('faint', '· use /reset in the TUI')}`);
+  }
+  lines.push('');
+  lines.push(s.fg('muted', `Last 30 days: ${formatTokens(report.totals.tokens)} tokens across ${plural(report.totals.requests, 'request')}.`));
+  const models = (report.models || []).slice(0, 8);
+  if (models.length) {
+    const topTokens = Math.max(1, ...models.map((m) => Number(m.tokens) || 0));
+    lines.push('');
+    for (const model of models) {
+      const share = Math.round(((Number(model.tokens) || 0) / topTokens) * 100);
+      lines.push(`  ${s.fg('text', model.modelId.padEnd(16))} ${progressBar(share, 12, s, 'info')} ${s.fg('muted', formatTokens(model.tokens).padStart(7))}  ${s.fg('faint', plural(model.requests, 'request'))}`);
+    }
+  }
+  if (stdout.isTTY) {
+    const box = roundedBox({
+      width: cliWidth(76),
+      styler: s,
+      title: 'quota & history',
+      borderColor: 'border',
+      lines,
+    });
+    for (const line of box) console.log(`  ${line}`);
+    console.log();
+  } else {
+    for (const line of lines) console.log(`  ${line}`);
   }
 }
 
 export async function runDoctorCommand({ config: providedConfig } = {}) {
   const config = providedConfig || loadConfig();
+  const s = activeStyler(config.theme);
   const checks = [];
   const add = (name, status, detail) => checks.push({ name, status, detail });
-  add('Node', process.versions.node.split('.')[0] >= 24 ? 'ok' : 'fail', `v${process.versions.node} (need 24 or newer)`);
+  add('Version', 'ok', `v${CLIENT_VERSION}`);
+  add('Node', Number(process.versions.node.split('.')[0]) >= 24 ? 'ok' : 'fail', `v${process.versions.node} (need 24 or newer)`);
   add('Platform', 'ok', `${process.platform} ${process.arch}`);
 
   const paths = filePaths();
@@ -470,7 +615,7 @@ export async function runDoctorCommand({ config: providedConfig } = {}) {
     }
     try {
       const models = await client.models();
-      add('Models', 'ok', `${models.data.length} public models, default ${models.defaultModel}`);
+      add('Models', 'ok', `${models.data.length} Gatita models, default ${models.defaultModel}`);
     } catch (error) {
       add('Models', 'warn', error.message);
     }
@@ -486,71 +631,135 @@ export async function runDoctorCommand({ config: providedConfig } = {}) {
   }
 
   const skills = loadSkills({ cwd: process.cwd() });
-  add('Skills', 'ok', skills.length ? `${skills.length} installed (global: ${path.join(paths.skills)})` : `none yet · premade example in ${path.join(paths.skills, 'example', 'SKILL.md')}`);
+  add('Skills', 'ok', skills.length ? `${skills.length} installed (${paths.skills})` : `none yet · example in ${path.join(paths.skills, 'example', 'SKILL.md')}`);
   const plugins = await loadPlugins({ cwd: process.cwd(), config });
   add('Plugins', plugins.plugins.length ? 'ok' : 'warn', plugins.plugins.length ? plugins.plugins.map((plugin) => plugin.name).join(', ') : 'none installed');
   const mcp = loadMcpConfig({ cwd: process.cwd(), config });
   const mcpEnabled = Object.entries(mcp).filter(([, raw]) => raw == null || typeof raw !== 'object' || raw.enabled !== false);
-  add('MCP servers', mcpEnabled.length ? 'ok' : 'warn', mcpEnabled.length ? `${mcpEnabled.length} configured (global: ${path.join(paths.home, 'mcp.json')})` : `none configured · gst mcp discover to find running ones · ${path.join(paths.home, 'mcp.json')} has a premade example`);
+  add('MCP servers', mcpEnabled.length ? 'ok' : 'warn', mcpEnabled.length ? `${mcpEnabled.length} configured (${path.join(paths.home, 'mcp.json')})` : `none configured · run gst mcp discover`);
   add('Computer use', config.computerUse ? (fs.existsSync(COMPUTER_HELPER_PATH) ? 'ok' : 'warn') : 'warn', config.computerUse ? 'enabled' : 'off (run /computer on in the TUI)');
 
   let failures = 0;
+  let warnings = 0;
+  const lines = [];
   for (const check of checks) {
-    const symbol = check.status === 'ok' ? color('success', '✓') : check.status === 'warn' ? color('warning', '!') : color('danger', '✗');
+    const symbol = check.status === 'ok' ? s.fg('success', GLYPHS.checked) : check.status === 'warn' ? s.fg('warning', '!') : s.fg('danger', GLYPHS.failed);
     if (check.status === 'fail') failures += 1;
-    console.log(`${symbol} ${check.name.padEnd(16)} ${color('muted', check.detail)}`);
+    if (check.status === 'warn') warnings += 1;
+    lines.push(`${symbol} ${s.fg('text', check.name.padEnd(15))} ${s.fg('muted', check.detail)}`);
   }
-  console.log('');
-  console.log(failures ? color('danger', `${failures} check${failures === 1 ? '' : 's'} failed.`) : color('success', 'Everything looks good.'));
+  const summary = failures
+    ? s.fg('danger', `${failures} check${failures === 1 ? '' : 's'} failed.`)
+    : warnings
+      ? s.fg('success', `Everything looks good (${warnings} optional notice${warnings === 1 ? '' : 's'}).`)
+      : s.fg('success', 'Everything looks good.');
+
+  if (stdout.isTTY) {
+    printHeader('GATITA DOCTOR', `v${CLIENT_VERSION}`, config.theme);
+    console.log();
+    const box = roundedBox({
+      width: cliWidth(78),
+      styler: s,
+      title: 'diagnostics',
+      borderColor: failures ? 'danger' : 'border',
+      titleColor: failures ? 'danger' : 'accent',
+      lines: [...lines, '', summary],
+    });
+    for (const line of box) console.log(`  ${line}`);
+    console.log();
+  } else {
+    for (const line of lines) console.log(line);
+    console.log('');
+    console.log(summary);
+  }
   if (failures) process.exitCode = 1;
 }
 
-export function printHelp() {
-  console.log(`${color('accent', 'ᓚᘏᗢ Gatita Studio')} ${color('faint', 'Your terminal. Her territory.')}`);
+export function printHelp({ includeServe = false } = {}) {
+  const s = activeStyler('dark');
+  const rows = [
+    [s.bold(s.fg('accent', 'SESSION')), ''],
+    ['gst / gatita-studio', 'start the full-screen coding agent'],
+    ['gst login [--key]', 'interactive sign in (account or API key)'],
+    ['gst logout', 'remove the saved session'],
+    ['gst models', 'list available Gatita models'],
+    ['gst usage', 'show token quota and 30-day usage'],
+    ['', ''],
+    [s.bold(s.fg('accent', 'WORKSPACE & TOOLS')), ''],
+    ['gst mcp', 'list connected MCP servers'],
+    ['gst mcp discover', 'probe localhost for running MCP servers'],
+    ['gst mcp add <name>', 'add an MCP server (--url or --command)'],
+    ['gst mcp remove <name>', 'remove a configured MCP server'],
+    ['gst skills', 'list installed skills'],
+    ['', ''],
+    [s.bold(s.fg('accent', 'SYSTEM')), ''],
+    ['gst update', 'check for and install updates'],
+    ['gst doctor', 'verify install, auth, and connection'],
+    ...(includeServe ? [['gatita-studio serve', 'run the Gatita Studio server']] : []),
+  ];
+
+  if (stdout.isTTY) {
+    printHeader('G A T I T A   S T U D I O', `v${CLIENT_VERSION}`, 'dark');
+    console.log(`     ${s.fg('muted', 'Your terminal. Her territory.')}`);
+    console.log();
+    const lines = rows.map(([cmd, desc]) => {
+      if (!cmd && !desc) return '';
+      if (!desc) return cmd;
+      return `  ${s.fg('text', padEndVisible(cmd, 24))} ${s.fg('muted', desc)}`;
+    });
+    const box = roundedBox({
+      width: cliWidth(72),
+      styler: s,
+      title: 'commands',
+      subtitle: 'aliases: gatita-studio · gst',
+      footer: 'flags: --new (fresh chat) · --model <id> · --version · --help',
+      borderColor: 'border',
+      lines,
+    });
+    for (const line of box) console.log(`  ${line}`);
+    console.log();
+    return;
+  }
+
+  console.log(`${s.fg('accent', `${GLYPHS.cat} Gatita Studio v${CLIENT_VERSION}`)} ${s.fg('faint', 'Your terminal. Her territory.')}`);
   console.log('');
   console.log('Usage:');
-  console.log(`  ${color('text', 'gatita-studio')} ${color('muted', '                 start the full-screen coding agent')}`);
-  console.log(`  ${color('text', 'gatita-studio login')} ${color('muted', '           sign in with a Gatita account')}`);
-  console.log(`  ${color('text', 'gatita-studio logout')} ${color('muted', '          remove the saved session')}`);
-  console.log(`  ${color('text', 'gatita-studio models')} ${color('muted', '          list Gatita models')}`);
-  console.log(`  ${color('text', 'gatita-studio usage')} ${color('muted', '           show token usage')}`);
-  console.log(`  ${color('text', 'gatita-studio mcp')} ${color('muted', '              list MCP servers')}`);
-  console.log(`  ${color('text', 'gatita-studio mcp discover')} ${color('muted', '    probe localhost for running MCP servers')}`);
-  console.log(`  ${color('text', 'gatita-studio mcp add <name>')} ${color('muted', '   add an MCP server (--url or --command)')}`);
-  console.log(`  ${color('text', 'gatita-studio mcp remove <name>')} ${color('muted', '  remove an MCP server')}`);
-  console.log(`  ${color('text', 'gatita-studio skills')} ${color('muted', '           list installed skills')}`);
-  console.log(`  ${color('text', 'gatita-studio update')} ${color('muted', '          check for and install updates')}`);
-  console.log(`  ${color('text', 'gatita-studio doctor')} ${color('muted', '          check the install')}`);
+  for (const [cmd, desc] of rows) {
+    if (!cmd || !desc) continue;
+    console.log(`  ${cmd.padEnd(28)} ${desc}`);
+  }
 }
 
 export async function runUpdate() {
+  const config = loadConfig();
+  const s = activeStyler(config.theme);
   const state = await checkForUpdate({ force: true });
   const notice = formatUpdateNotice(state);
   if (!notice) {
-    console.log(`Gatita Studio is up to date (${CLIENT_VERSION}).`);
+    console.log(`${s.fg('success', GLYPHS.checked)} Gatita Studio is up to date (v${CLIENT_VERSION}).`);
     return;
   }
   console.log(notice.message);
-  if (notice.size) console.log(`  size: ${notice.size}`);
+  if (notice.size) console.log(s.fg('muted', `  size: ${notice.size}`));
   const answer = await ask('Download and install now? [Y/n]: ', 'y');
   if (answer.toLowerCase() === 'n') {
     console.log('Update cancelled.');
     return;
   }
   try {
-    console.log('Downloading update…');
+    console.log(s.fg('muted', 'Downloading update…'));
     const buffer = await downloadUpdate({ tarballUrl: state.tarball });
-    console.log('Installing…');
+    console.log(s.fg('muted', 'Installing…'));
     installTarball(buffer, { sha256: state.sha256 });
-    console.log('Gatita Studio updated. Please restart to use the new version.');
+    console.log(s.fg('success', `${GLYPHS.checked} Gatita Studio updated. Please restart to use the new version.`));
   } catch (error) {
-    console.error(color('danger', `Update failed: ${error.message}`));
+    console.error(s.fg('danger', `Update failed: ${error.message}`));
     process.exitCode = 1;
   }
 }
 
 export async function runCliCommand(command, rest = []) {
-  if (command === 'login') return runLogin();
+  if (command === 'login') return runLogin(rest);
   if (command === 'logout') return runLogout();
   if (command === 'models') return runModels();
   if (command === 'usage') return runUsage();

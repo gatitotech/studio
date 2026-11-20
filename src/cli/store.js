@@ -81,7 +81,7 @@ export const LIMITS = {
   folderName: 60,
   messageChars: 2_000_000,
   snapshotsPerChat: 200,
-  messagesPerChat: 2000,
+  messagesPerChat: null,
 };
 
 export function openLocalStore(filePath) {
@@ -285,9 +285,15 @@ export function createStore(db) {
     },
 
     listMessages(chatId, { limit = LIMITS.messagesPerChat } = {}) {
+      const cap = Number(limit);
+      if (Number.isFinite(cap) && cap > 0) {
+        return db.prepare(`
+          SELECT * FROM messages WHERE chat_id = ? ORDER BY seq ASC LIMIT ?
+        `).all(String(chatId), Math.floor(cap)).map(mapMessage);
+      }
       return db.prepare(`
-        SELECT * FROM messages WHERE chat_id = ? ORDER BY seq ASC LIMIT ?
-      `).all(String(chatId), Math.max(1, Number(limit) || LIMITS.messagesPerChat)).map(mapMessage);
+        SELECT * FROM messages WHERE chat_id = ? ORDER BY seq ASC
+      `).all(String(chatId)).map(mapMessage);
     },
 
     deleteMessages(chatId) {

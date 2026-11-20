@@ -72,5 +72,5 @@ export function updateConfig(patch) {
 }
 
 export function loadTheme(themeName) {
-  return themeName === 'paper' ? 'paper' : 'dark';
+  return ['dark', 'paper', 'midnight', 'ember'].includes(themeName) ? themeName : 'dark';
 }

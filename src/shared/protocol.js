@@ -6,7 +6,7 @@ export const DEFAULT_STUDIO_PATH = '/studio';
 export const DEFAULT_SERVER_URL = `https://api.gatita.tech${DEFAULT_STUDIO_PATH}`;
 
 export const CLIENT_NAME = 'gatita-studio';
-export const CLIENT_VERSION = '1.0.0';
+export const CLIENT_VERSION = '1.2.0';
 export const USER_AGENT = `${CLIENT_NAME}/${CLIENT_VERSION}`;
 
 export const EVENT = Object.freeze({
@@ -51,11 +51,11 @@ export const AGENT_LIMITS = Object.freeze({
   maxSteps: 50,
   maxSubagentSteps: 16,
   maxToolCallsPerStep: 16,
-  maxMessages: 400,
+  maxMessages: null,
   maxTools: 96,
   maxMessageBytes: 512 * 1024,
-  maxBodyBytes: 16 * 1024 * 1024,
-  maxImagesPerRequest: 8,
+  maxBodyBytes: 64 * 1024 * 1024,
+  maxImagesPerRequest: 64,
   maxImageBytes: 5 * 1024 * 1024,
 });
 

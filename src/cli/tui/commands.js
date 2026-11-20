@@ -4,7 +4,7 @@ import path from 'node:path';
 import { saveConfig } from '../config.js';
 import { clearStoredAuth } from '../authStore.js';
 import { bestEffortLogout } from '../commands.js';
-import { createStyler } from '../theme.js';
+import { createStyler, THEME_NAMES } from '../theme.js';
 import { writeClipboard } from '../clipboard.js';
 import { discoverMcpServers } from '../../mcp/discover.js';
 import { basenameForDisplay, formatTokens, plural, truncate } from '../../shared/util.js';
@@ -17,8 +17,8 @@ export const SLASH_COMMANDS = [
   { name: 'model', aliases: ['m'], description: 'Switch the Gatita model' },
   { name: 'reasoning', aliases: ['think'], description: 'Set thinking depth: off, low, max' },
   { name: 'thinking', description: 'Show or hide reasoning text' },
-  { name: 'new', aliases: ['n'], description: 'Start a new chat' },
-  { name: 'sessions', aliases: ['resume'], description: 'Switch conversations' },
+  { name: 'new', aliases: ['n'], description: 'Start a new chat tab' },
+  { name: 'chats', aliases: ['sessions', 'resume'], description: 'Browse, switch, or manage chats' },
   { name: 'rename', description: 'Rename this chat' },
   { name: 'delete', description: 'Delete this chat' },
   { name: 'folders', description: 'Choose a folder' },
@@ -39,13 +39,14 @@ export const SLASH_COMMANDS = [
   { name: 'plugins', description: 'Show loaded plugins' },
   { name: 'permissions', description: 'Toggle which tools need approval' },
   { name: 'sound', description: 'Toggle sounds for prompts and finished tasks' },
-  { name: 'theme', description: 'Switch between dark and paper' },
+  { name: 'theme', description: 'Switch theme: dark, paper, midnight, ember' },
   { name: 'cwd', description: 'Change the workspace folder' },
   { name: 'image', description: 'Attach an image for a vision model' },
   { name: 'copy', description: 'Copy the last answer to the clipboard' },
+  { name: 'palette', aliases: ['cmd'], description: 'Open quick command palette (ctrl+p)' },
   { name: 'update', description: 'Check for and install Gatita Studio updates' },
   { name: 'version', aliases: ['v'], description: 'Show the Gatita Studio version' },
-  { name: 'login', description: 'How to sign in again' },
+  { name: 'login', aliases: ['account'], description: 'Sign in or switch Gatita account' },
   { name: 'logout', description: 'Sign out and quit' },
   { name: 'quit', aliases: ['q', 'exit'], description: 'Leave Gatita Studio' },
 ];
@@ -122,70 +123,15 @@ function oneLine(value, max = 160) {
   return truncate(text, max);
 }
 
-function summarizeMessages(messages) {
-  const bullets = [];
-  for (const message of messages) {
-    if (message.role === 'user' && message.content) {
-      bullets.push(`- User: ${oneLine(message.content, 140)}`);
-    } else if (message.role === 'assistant') {
-      if (message.content) bullets.push(`- Gatita: ${oneLine(message.content, 140)}`);
-      if (Array.isArray(message.toolCalls) && message.toolCalls.length) {
-        const names = message.toolCalls.map((call) => call.function?.name).filter(Boolean);
-        if (names.length) bullets.push(`- Tools used: ${[...new Set(names)].join(', ')}`);
-      }
-    }
-  }
-  return (bullets.length ? bullets : ['- Earlier messages were compacted.']).slice(-14).join('\n');
-}
-
-function compactChat(app) {
+async function compactChat(app) {
   const chat = currentChat(app);
   if (!chat) return;
   if (!guardIdle(app)) return;
-  const messages = app.store.listMessages(chat.id);
-  if (messages.length <= 10) {
-    flash(app, 'This conversation is already short.', 'muted');
+  if (typeof app.compactCurrentChat === 'function') {
+    await app.compactCurrentChat();
     return;
   }
-  const removed = messages.slice(0, messages.length - 10);
-  let kept = messages.slice(-10);
-  while (kept.length && kept[0].role === 'tool') kept = kept.slice(1);
-  if (kept.length && kept[0].role === 'assistant' && Array.isArray(kept[0].toolCalls)) {
-    kept = kept.slice(1);
-    while (kept.length && kept[0].role === 'tool') kept = kept.slice(1);
-  }
-  if (!kept.length) {
-    flash(app, 'Nothing safe to compact.', 'warning');
-    return;
-  }
-  const todos = app.store.listTodos(chat.id);
-  const summary = summarizeMessages(removed);
-  app.store.deleteMessages(chat.id);
-  app.store.addMessage(chat.id, {
-    role: 'system',
-    content: `Summary of earlier conversation (${removed.length} messages compacted):\n${summary}`,
-  });
-  for (const message of kept) {
-    app.store.addMessage(chat.id, {
-      id: message.id,
-      role: message.role,
-      content: message.content,
-      reasoning: message.reasoning,
-      toolCalls: message.toolCalls,
-      toolCallId: message.toolCallId,
-      name: message.name,
-      createdAt: message.createdAt,
-      meta: message.meta,
-    });
-  }
-  if (todos.length) app.store.replaceTodos(chat.id, todos);
-  app.messages = app.store.listMessages(chat.id);
-  app.todos = app.store.listTodos(chat.id);
-  app.transcriptCache.clear();
-  app.followBottom = true;
-  app.scrollOffset = 0;
-  app.requestRender();
-  flash(app, `Compacted ${removed.length} messages into a summary.`, 'success');
+  flash(app, 'Compaction is unavailable right now.', 'warning');
 }
 
 function projectTemplate(cwd) {
@@ -410,6 +356,7 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
       app.newChat({ title, folderId: app.config.lastFolderId || null, cwd: app.cwd });
       return;
     }
+    case 'chats':
     case 'sessions':
       app.openDialog({ type: 'sessions', index: 0, filter: '' });
       return;
@@ -449,6 +396,9 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
         const goalKey = typeof app.goalStoreKey === 'function' ? app.goalStoreKey(chat.id) : null;
         if (goalKey) app.store.setSetting(goalKey, '');
         app.store.deleteChat(chat.id);
+        if (Array.isArray(app.openTabIds)) {
+          app.openTabIds = app.openTabIds.filter((id) => id !== chat.id);
+        }
         app.chat = null;
         app.messages = [];
         app.todos = [];
@@ -600,7 +550,7 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
       await app.runAdminCommand(args);
       return;
     case 'compact':
-      compactChat(app);
+      await compactChat(app);
       return;
     case 'clear': {
       const chat = currentChat(app);
@@ -709,8 +659,8 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
         app.toggleTheme();
         return;
       }
-      if (!['dark', 'paper'].includes(value)) {
-        flash(app, 'Use /theme dark or /theme paper.', 'warning');
+      if (!THEME_NAMES.includes(value)) {
+        flash(app, `Use /theme with: ${THEME_NAMES.join(', ')}.`, 'warning');
         return;
       }
       app.config.theme = value;
@@ -723,6 +673,10 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
     }
     case 'cwd': {
       if (!args.trim()) {
+        if (typeof app.openWorkspaceDialog === 'function') {
+          app.openWorkspaceDialog();
+          return;
+        }
         showText(app, 'workspace', [
           app.styler.fg('muted', app.cwd),
           '',
@@ -796,8 +750,16 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
       }
       return;
     }
+    case 'palette':
+      if (typeof app.openPalette === 'function') app.openPalette();
+      else app.openDialog({ type: 'palette', filter: '', index: 0 });
+      return;
     case 'login':
-      flash(app, `Run gatita-studio login, then restart. Server: ${app.config.serverUrl}`, 'info');
+      if (typeof app.openLoginDialog === 'function') {
+        app.openLoginDialog({ mode: args.trim().toLowerCase() === 'key' ? 'token' : 'credentials' });
+      } else {
+        flash(app, `Run gatita-studio login to switch accounts. Server: ${app.config.serverUrl}`, 'info');
+      }
       return;
     case 'update': {
       await app.setFlash('Checking for updates…', 'muted');
@@ -839,9 +801,13 @@ export async function executeSlashCommand(app, rawName, args = '', raw = '') {
     }
     case 'version':
       showText(app, 'version', [
-        `${app.styler.fg('accent', 'gatita studio')} ${CLIENT_VERSION}`,
+        `${app.styler.fg('accent', 'ᓚᘏᗢ')} ${app.styler.bold(app.styler.fg('accent', 'gatita studio'))} ${app.styler.fg('text', `v${CLIENT_VERSION}`)}`,
+        app.styler.fg('muted', 'Your terminal. Her territory.'),
         '',
-        app.styler.fg('muted', 'node ' + process.versions.node),
+        `${app.styler.fg('faint', 'runtime ')} ${app.styler.fg('muted', `node ${process.versions.node}`)}`,
+        `${app.styler.fg('faint', 'theme   ')} ${app.styler.fg('muted', app.config.theme || 'dark')}`,
+        `${app.styler.fg('faint', 'server  ')} ${app.styler.fg('muted', app.config.serverUrl)}`,
+        '',
         app.styler.fg('faint', '/update checks the release manifest for a newer build'),
       ]);
       return;

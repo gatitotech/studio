@@ -71,6 +71,248 @@ export function compatibilityMessages(context = '') {
   return output;
 }
 
+export const AUTO_COMPACT_RATIO = 0.85;
+export const DEFAULT_KEEP_RECENT = 6;
+
+const COMPACTION_PROMPT = [
+  'Compact this entire conversation into a clear, self-contained continuation brief so work can continue seamlessly without the earlier turns.',
+  'Include:',
+  '- Goal and explicit user requirements or preferences',
+  '- Key technical decisions, conventions, and constraints',
+  '- Files inspected or modified, important symbols, commands, and current state',
+  '- What is already finished and verified',
+  '- Open tasks, pending questions, errors, or immediate next steps',
+  'Be thorough yet concise. Write plain markdown with short headings and bullet points. Do not call any tools.',
+].join('\n');
+
+export function isCompactionCheckpoint(message) {
+  return message?.role === 'system' && message?.meta?.kind === 'compaction';
+}
+
+export function activeHistoryForModel(history) {
+  const list = Array.isArray(history) ? history : [];
+  let latestIndex = -1;
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    if (isCompactionCheckpoint(list[index])) {
+      latestIndex = index;
+      break;
+    }
+  }
+  if (latestIndex === -1) return list;
+
+  const checkpoint = list[latestIndex];
+  const keptFromSeq = Number(checkpoint.meta?.keptFromSeq);
+  const keptBefore = Number.isFinite(keptFromSeq) && keptFromSeq > 0
+    ? list.slice(0, latestIndex).filter((msg) => !isCompactionCheckpoint(msg) && Number(msg.seq || 0) >= keptFromSeq)
+    : [];
+  const after = list.slice(latestIndex + 1).filter((msg) => !isCompactionCheckpoint(msg));
+  const combined = [checkpoint, ...keptBefore, ...after];
+  // Ensure we never start kept/post messages with an orphaned tool message.
+  let cleanTail = combined.slice(1);
+  while (cleanTail.length && cleanTail[0].role === 'tool') cleanTail = cleanTail.slice(1);
+  if (cleanTail.length && cleanTail[0].role === 'assistant' && Array.isArray(cleanTail[0].toolCalls) && cleanTail[0].toolCalls.length) {
+    const firstCallId = cleanTail[0].toolCalls[0]?.id;
+    const hasToolReply = firstCallId && cleanTail.some((msg) => msg.role === 'tool' && msg.toolCallId === firstCallId);
+    if (!hasToolReply) {
+      cleanTail = cleanTail.slice(1);
+      while (cleanTail.length && cleanTail[0].role === 'tool') cleanTail = cleanTail.slice(1);
+    }
+  }
+  return [checkpoint, ...cleanTail];
+}
+
+export function computeContextMetrics({ history = [], prefixMessages = [], model = null, lastPromptTokens = 0 } = {}) {
+  const list = Array.isArray(history) ? history : [];
+  const active = activeHistoryForModel(list);
+  const apiMessages = toApiMessages(active);
+  const estimated = estimateMessagesTokens([...(Array.isArray(prefixMessages) ? prefixMessages : []), ...apiMessages]);
+  const reported = Number(lastPromptTokens) || 0;
+  const contextWindow = Math.max(1024, Number(model?.contextWindow) || 131_072);
+  const usedTokens = Math.min(contextWindow, Math.max(estimated, reported));
+  const ratio = contextWindow > 0 ? Math.min(1, usedTokens / contextWindow) : 0;
+  const percent = Math.min(100, Math.round(ratio * 1000) / 10);
+  return {
+    usedTokens,
+    contextWindow,
+    percent,
+    ratio,
+    activeCount: active.length,
+    totalCount: list.length,
+  };
+}
+
+function splitRecentForCompaction(active, keepRecent = DEFAULT_KEEP_RECENT, maxKeepTokens = Infinity) {
+  const nonCheckpoints = active.filter((msg) => !isCompactionCheckpoint(msg));
+  if (nonCheckpoints.length < 2) {
+    return { older: nonCheckpoints, kept: [] };
+  }
+  let keepCount = Math.min(Math.max(0, Number(keepRecent) || 0), Math.max(0, nonCheckpoints.length - 2));
+  if (nonCheckpoints.length <= 3) keepCount = 0;
+  let splitIndex = nonCheckpoints.length - keepCount;
+
+  // Also ensure kept recent messages stay within the token cap so compaction
+  // reliably frees context headroom even when recent turns are very large.
+  if (Number.isFinite(maxKeepTokens) && maxKeepTokens > 0 && splitIndex < nonCheckpoints.length) {
+    let keptTokens = 0;
+    let allowedFrom = nonCheckpoints.length;
+    for (let i = nonCheckpoints.length - 1; i >= splitIndex; i -= 1) {
+      const msgTokens = estimateMessagesTokens(toApiMessages([nonCheckpoints[i]]));
+      if (keptTokens + msgTokens > maxKeepTokens && allowedFrom < nonCheckpoints.length) break;
+      if (keptTokens + msgTokens > maxKeepTokens && i < nonCheckpoints.length - 1) break;
+      keptTokens += msgTokens;
+      allowedFrom = i;
+    }
+    splitIndex = Math.max(splitIndex, allowedFrom);
+  }
+
+  // Walk splitIndex forward so kept messages never start with an orphaned tool result
+  // or a half-completed tool-call turn.
+  while (splitIndex < nonCheckpoints.length && nonCheckpoints[splitIndex].role === 'tool') {
+    splitIndex += 1;
+  }
+  if (splitIndex < nonCheckpoints.length && nonCheckpoints[splitIndex].role === 'assistant' && Array.isArray(nonCheckpoints[splitIndex].toolCalls)) {
+    splitIndex += 1;
+    while (splitIndex < nonCheckpoints.length && nonCheckpoints[splitIndex].role === 'tool') {
+      splitIndex += 1;
+    }
+  }
+  return {
+    older: nonCheckpoints.slice(0, splitIndex),
+    kept: nonCheckpoints.slice(splitIndex),
+  };
+}
+
+function buildFallbackSummary(messages) {
+  const bullets = [];
+  for (const message of messages) {
+    const line = String(message.content || '').replace(/\s+/g, ' ').trim();
+    const short = line.length > 160 ? `${line.slice(0, 159)}…` : line;
+    if (message.role === 'user' && short) {
+      bullets.push(`- User: ${short}`);
+    } else if (message.role === 'assistant') {
+      if (short) bullets.push(`- Gatita: ${short}`);
+      if (Array.isArray(message.toolCalls) && message.toolCalls.length) {
+        const names = message.toolCalls.map((call) => call.function?.name).filter(Boolean);
+        if (names.length) bullets.push(`- Tools used: ${[...new Set(names)].join(', ')}`);
+      }
+    }
+  }
+  return [
+    'Summary of earlier conversation:',
+    ...(bullets.length ? bullets.slice(-16) : ['- Earlier messages were compacted.']),
+  ].join('\n');
+}
+
+export async function compactConversation({
+  api,
+  store,
+  chat,
+  cwd = process.cwd(),
+  model,
+  plan = 'free',
+  registry = null,
+  history = null,
+  keepRecent = DEFAULT_KEEP_RECENT,
+  auto = false,
+  signal,
+  onEvent = () => {},
+} = {}) {
+  const chatId = chat?.id;
+  if (!chatId || !store) return { skipped: true, reason: 'no_chat' };
+  const allMessages = Array.isArray(history) ? history : store.listMessages(chatId);
+  const active = activeHistoryForModel(allMessages);
+  const nonCheckpoints = active.filter((msg) => !isCompactionCheckpoint(msg));
+  if (nonCheckpoints.length < 2) {
+    return { skipped: true, reason: 'short' };
+  }
+
+  const prefix = compatibilityMessages(buildWorkspaceContext({
+    cwd,
+    model: { ...(model || {}), reasoning: 'off' },
+    plan,
+    computerEnabled: false,
+    skills: registry?.skillsForPrompt || [],
+  }));
+
+  const metricsBefore = computeContextMetrics({ history: allMessages, prefixMessages: prefix, model });
+  const maxKeepTokens = Math.max(1_000, Math.floor(metricsBefore.contextWindow * 0.2));
+  const { older, kept } = splitRecentForCompaction(active, keepRecent, maxKeepTokens);
+  const compactedCount = older.length;
+  const keptFromSeq = kept.length ? Number(kept[0].seq || 0) : null;
+  const maxOutput = Math.min(4096, Number(model?.maxOutputTokens) || 4096);
+  const compactBudget = Math.max(4_000, metricsBefore.contextWindow - maxOutput - 8_000 - estimateMessagesTokens(prefix));
+
+  let summary = '';
+  let usage = null;
+  if (typeof api?.streamChat === 'function' && model?.id) {
+    const apiMessages = toApiMessages(active);
+    const trimmed = trimForContext(apiMessages, compactBudget);
+    const requestMessages = [
+      ...prefix,
+      ...trimmed.messages,
+      { role: 'user', content: COMPACTION_PROMPT },
+    ];
+    try {
+      const result = await api.streamChat({
+        messages: requestMessages,
+        tools: [],
+        model: model.id,
+        reasoning: 'off',
+        maxTokens: maxOutput,
+        sessionId: chatId,
+        signal,
+        onEvent: (event, data) => {
+          if (event === 'start') onEvent({ type: 'response_start', data });
+        },
+      });
+      summary = String(result?.text || '').trim();
+      if (result?.usage) {
+        usage = {
+          promptTokens: Number(result.usage.promptTokens || 0),
+          completionTokens: Number(result.usage.completionTokens || 0),
+          totalTokens: Number(result.usage.totalTokens || 0),
+        };
+      }
+    } catch (error) {
+      if (error?.code === 'aborted' || signal?.aborted) throw error;
+      // Fall back to structured local summary if the compaction call fails.
+      summary = '';
+    }
+  }
+
+  if (!summary) {
+    summary = buildFallbackSummary(older.length ? older : nonCheckpoints);
+  }
+
+  const checkpoint = store.addMessage(chatId, {
+    role: 'system',
+    content: summary,
+    meta: {
+      kind: 'compaction',
+      compactedCount,
+      keptFromSeq,
+      keepRecentCount: kept.length,
+      auto: Boolean(auto),
+      tokensBefore: metricsBefore.usedTokens,
+      createdAt: Date.now(),
+    },
+  });
+
+  const updatedHistory = store.listMessages(chatId);
+  const metricsAfter = computeContextMetrics({ history: updatedHistory, prefixMessages: prefix, model });
+  return {
+    skipped: false,
+    summary,
+    checkpoint,
+    compactedCount,
+    keptCount: kept.length,
+    tokensBefore: metricsBefore.usedTokens,
+    tokensAfter: metricsAfter.usedTokens,
+    percentAfter: metricsAfter.percent,
+    usage,
+  };
+}
+
 export function toApiMessages(history) {
   const output = [];
   for (const message of history) {
@@ -110,12 +352,21 @@ function trimForContext(messages, budget) {
   if (messages.length <= 1) return { messages, trimmed: 0 };
   const total = estimateMessagesTokens(messages);
   if (total <= budget) return { messages, trimmed: 0 };
+
+  const hasPinnedSummary = messages[0]?.role === 'user'
+    && typeof messages[0]?.content === 'string'
+    && messages[0].content.startsWith('Earlier conversation summary:\n');
+  const pinned = hasPinnedSummary ? messages[0] : null;
+  const pinnedTokens = pinned ? estimateMessagesTokens([pinned]) : 0;
+  const pool = pinned ? messages.slice(1) : messages;
+  const remainingBudget = Math.max(512, budget - pinnedTokens);
+
   const tail = [];
   let tailTokens = 0;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
+  for (let index = pool.length - 1; index >= 0; index -= 1) {
+    const message = pool[index];
     const tokens = estimateMessagesTokens([message]);
-    if (tailTokens + tokens > budget) break;
+    if (tailTokens + tokens > remainingBudget) break;
     tail.unshift(message);
     tailTokens += tokens;
   }
@@ -124,12 +375,13 @@ function trimForContext(messages, budget) {
     tail.shift();
     while (tail.length && tail[0].role === 'tool') tail.shift();
   }
-  if (!tail.length) {
-    const lastUser = [...messages].reverse().find((message) => message.role === 'user');
+  if (!tail.length && !pinned) {
+    const lastUser = [...pool].reverse().find((message) => message.role === 'user');
     if (lastUser) tail.push(lastUser);
   }
-  const trimmed = Math.max(0, messages.length - tail.length);
-  return { messages: tail, trimmed };
+  const result = pinned ? [pinned, ...tail] : tail;
+  const trimmed = Math.max(0, messages.length - result.length);
+  return { messages: result, trimmed };
 }
 
 function parseToolArguments(raw) {
@@ -206,6 +458,7 @@ export async function runAgent({
   tasks = null,
   slowToolMs = 20_000,
   takeSteering = null,
+  initialPromptTokens = 0,
 }) {
   const chatId = chat.id;
   const startedAt = Date.now();
@@ -231,6 +484,8 @@ export async function runAgent({
   const maxOutput = Math.min(Number(model.maxOutputTokens) || 8192, 32_768);
   let history = store.listMessages(chatId);
   let totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  let lastPromptTokens = Math.max(0, Number(initialPromptTokens) || 0);
+  let lastCompactedSeq = -1;
   let step = 0;
   let trimmedOnce = false;
   let finalText = '';
@@ -264,7 +519,7 @@ export async function runAgent({
       .map((item) => ({
         text: String(item?.text ?? item ?? '').trim(),
         images: Array.isArray(item?.images)
-          ? item.images.map((image) => image?.dataUrl).filter((url) => typeof url === 'string' && url.startsWith('data:image/')).slice(0, 8)
+          ? item.images.map((image) => image?.dataUrl).filter((url) => typeof url === 'string' && url.startsWith('data:image/')).slice(0, 32)
           : [],
       }))
       .filter((item) => item.text)
@@ -293,10 +548,58 @@ export async function runAgent({
     // mcp tool) become available immediately.
     const tools = model.tools ? registry.definitions({ mode }) : [];
 
-    const apiMessages = toApiMessages(history);
+    // Automatically compact when active context reaches ~85%.
+    let metrics = computeContextMetrics({ history, prefixMessages: prefix, model, lastPromptTokens });
+    const latestSeq = Number(history[history.length - 1]?.seq || history.length || 0);
+    if (metrics.ratio >= AUTO_COMPACT_RATIO && metrics.activeCount >= 4 && latestSeq !== lastCompactedSeq) {
+      lastCompactedSeq = latestSeq;
+      emit({ type: 'compacting', auto: true, percent: metrics.percent });
+      emit({ type: 'notice', message: `Context reached ${Math.round(metrics.percent)}% — compacting conversation…` });
+      try {
+        const compacted = await compactConversation({
+          api,
+          store,
+          chat,
+          cwd,
+          model,
+          plan,
+          registry,
+          history,
+          keepRecent: DEFAULT_KEEP_RECENT,
+          auto: true,
+          signal,
+          onEvent: emit,
+        });
+        if (!compacted.skipped) {
+          history = store.listMessages(chatId);
+          lastPromptTokens = 0;
+          if (compacted.usage) {
+            totalUsage.promptTokens += compacted.usage.promptTokens;
+            totalUsage.completionTokens += compacted.usage.completionTokens;
+            totalUsage.totalTokens += compacted.usage.totalTokens;
+          }
+          metrics = computeContextMetrics({ history, prefixMessages: prefix, model, lastPromptTokens: 0 });
+          emit({
+            type: 'compacted',
+            auto: true,
+            compactedCount: compacted.compactedCount,
+            keptCount: compacted.keptCount,
+            percentAfter: compacted.percentAfter,
+          });
+        }
+      } catch (error) {
+        if (error?.code === 'aborted' || signal?.aborted) {
+          emit({ type: 'aborted' });
+          return { aborted: true, usage: totalUsage, steps: step };
+        }
+      }
+    }
+
+    const activeHistory = activeHistoryForModel(history);
+    const apiMessages = toApiMessages(activeHistory);
     const budget = Math.max(
       4_000,
-      (Number(model.contextWindow) || 131_072) - maxOutput - 8_000 - contextTokens,
+      metrics.contextWindow - maxOutput - 8_000 - contextTokens,
     );
     const trimmed = trimForContext(apiMessages, budget);
     const requestMessages = [...prefix, ...trimmed.messages];
@@ -367,6 +670,7 @@ export async function runAgent({
       completionTokens: Number(result.usage?.completionTokens || 0),
       totalTokens: Number(result.usage?.totalTokens || 0),
     };
+    if (usage.promptTokens > 0) lastPromptTokens = usage.promptTokens;
     totalUsage.promptTokens += usage.promptTokens;
     totalUsage.completionTokens += usage.completionTokens;
     totalUsage.totalTokens += usage.totalTokens;

@@ -1,6 +1,8 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { loadConfig, saveConfig } from './config.js';
+import { saveStoredAuth } from './authStore.js';
 import { createApiClient, ApiError } from './api.js';
 import { openLocalStore } from './store.js';
 import { ensureLogin } from './commands.js';
@@ -9,18 +11,39 @@ import { loadPlugins } from '../plugins/index.js';
 import { createMcpManager, loadMcpConfig } from '../mcp/index.js';
 import { createComputerController } from '../computer/index.js';
 import { createToolRegistry } from '../tools/index.js';
-import { runAgent } from './agent.js';
+import {
+  runAgent,
+  compactConversation,
+  computeContextMetrics,
+  isCompactionCheckpoint,
+  AUTO_COMPACT_RATIO,
+} from './agent.js';
 import { checkForUpdate, formatUpdateNotice } from './update.js';
 import { readClipboard, writeClipboard, readClipboardImage } from './clipboard.js';
 import { createTaskManager } from './tasks.js';
 import { playChime } from './sound.js';
 import { Terminal } from './tui/terminal.js';
-import { renderMarkdown, wrapPlain, roundedBox, progressBar, renderDialogBand, paintRow } from './tui/render.js';
+import { LoginView } from './tui/login.js';
+import {
+  renderMarkdown,
+  wrapPlain,
+  roundedBox,
+  progressBar,
+  renderDialogBand,
+  paintRow,
+  paintSurface,
+  badge,
+  button,
+  placeSegments,
+} from './tui/render.js';
+import { openExternalUrl, PLAN_URL } from './openUrl.js';
 import {
   createStyler,
   GLYPHS,
   SPINNER,
   THINKING,
+  THEME_NAMES,
+  THEME_LABELS,
   selectGlyph,
   truncateVisible,
   padEndVisible,
@@ -29,6 +52,7 @@ import {
   stripAnsi,
   centerVisible,
 } from './theme.js';
+import { CLIENT_VERSION } from '../shared/protocol.js';
 import {
   basenameForDisplay,
   formatClock,
@@ -41,7 +65,7 @@ import { truncateToWidth } from './theme.js';
 import { SLASH_COMMANDS, commandSuggestions, executeSlashCommand } from './tui/commands.js';
 import { skillSuggestions, extractSkillMentions } from '../skills/index.js';
 
-const MAX_COMPOSER_IMAGES = 8;
+const MAX_COMPOSER_IMAGES = 32;
 const COMPOSER_TOKEN_RE = /\u0001([a-z]+):([a-zA-Z0-9]+)\u0001/g;
 
 const TOOL_ICONS = {
@@ -73,6 +97,35 @@ function makeTitle(text) {
   const first = String(text || '').trim().split(/\r?\n/)[0].replace(/\s+/g, ' ');
   if (!first) return 'New chat';
   return first.length > 60 ? `${first.slice(0, 57)}…` : first;
+}
+
+function formatCwdForDisplay(rawPath, maxWidth = 36) {
+  const full = String(rawPath || '').trim();
+  if (!full) return '.';
+  const home = os.homedir?.() || '';
+  let display = full;
+  if (home && full.toLowerCase().startsWith(home.toLowerCase())) {
+    const rest = full.slice(home.length);
+    if (!rest || rest.startsWith(path.sep) || rest.startsWith('/') || rest.startsWith('\\')) {
+      display = `~${rest}`;
+    }
+  }
+  if (visibleWidth(display) <= maxWidth) return display;
+  const sep = display.includes('\\') ? '\\' : '/';
+  const parts = display.split(/[\\/]+/).filter(Boolean);
+  if (parts.length <= 1) return truncateVisible(display, maxWidth);
+  const root = display.startsWith('~')
+    ? '~'
+    : /^[A-Za-z]:/.test(display)
+      ? parts[0]
+      : '';
+  const tail = parts[parts.length - 1];
+  const parent = parts.length >= 3 ? parts[parts.length - 2] : '';
+  const withParent = `${root}${sep}…${sep}${parent}${sep}${tail}`;
+  if (parent && visibleWidth(withParent) <= maxWidth) return withParent;
+  const compact = `${root}${sep}…${sep}${tail}`;
+  if (visibleWidth(compact) <= maxWidth) return compact;
+  return truncateVisible(tail, maxWidth);
 }
 
 function reasoningLabel(level) {
@@ -131,6 +184,10 @@ export class App {
     this.quota = me?.quota || null;
     this.folders = [];
     this.recentChats = [];
+    this.openTabIds = [];
+    this.tabsInitialized = false;
+    this.hoverHit = null;
+    this.headerHeight = 3;
     this.chat = null;
     this.messages = [];
     this.todos = [];
@@ -163,6 +220,8 @@ export class App {
     this.online = true;
     this.sessionTokens = 0;
     this.lastTurnUsage = null;
+    this.lastPromptTokens = 0;
+    this.compacting = false;
     this.skills = [];
     this.plugins = null;
     this.mcp = null;
@@ -203,6 +262,8 @@ export class App {
     this.soundPlayer = null;
     // Injectable for tests; defaults to the real clipboard.
     this.clipboard = { read: readClipboard, write: writeClipboard, readImage: readClipboardImage };
+    // Injectable for tests; defaults to opening URLs in the OS default browser.
+    this.openUrl = openExternalUrl;
     // Open multiple-choice questions (the `ask` tool): id → { questions, openedAt, expiresAt, status, results }.
     this.questions = new Map();
     this.nextQuestionId = 0;
@@ -335,6 +396,177 @@ export class App {
   refreshSidebar() {
     this.folders = this.store.listFolders();
     this.recentChats = this.store.recentChats(30);
+    this.syncOpenTabs();
+  }
+
+  syncOpenTabs() {
+    if (!this.closedTabIds) this.closedTabIds = new Set();
+    const known = new Map((this.recentChats || []).map((chat) => [chat.id, chat]));
+    if (this.chat && !known.has(this.chat.id)) known.set(this.chat.id, this.chat);
+    // Prune deleted chats from open tabs.
+    this.openTabIds = (this.openTabIds || []).filter((id) => known.has(id));
+    // Seed initial tabs with recent chats that weren't explicitly closed.
+    if (!this.tabsInitialized) {
+      for (const chat of (this.recentChats || []).slice(0, 6)) {
+        if (!this.closedTabIds.has(chat.id) && !this.openTabIds.includes(chat.id)) {
+          this.openTabIds.push(chat.id);
+        }
+      }
+      this.tabsInitialized = true;
+    } else {
+      // Include any newly created chats that haven't been closed.
+      for (const chat of (this.recentChats || []).slice(0, 6)) {
+        if (!this.closedTabIds.has(chat.id) && !this.openTabIds.includes(chat.id) && this.openTabIds.length < 8) {
+          this.openTabIds.push(chat.id);
+        }
+      }
+    }
+    if (this.chat && !this.openTabIds.includes(this.chat.id)) {
+      this.closedTabIds.delete(this.chat.id);
+      this.openTabIds.unshift(this.chat.id);
+    }
+  }
+
+  ensureTabOpen(chatId) {
+    if (!chatId) return;
+    if (!this.closedTabIds) this.closedTabIds = new Set();
+    this.closedTabIds.delete(chatId);
+    if (!this.openTabIds.includes(chatId)) {
+      this.openTabIds.push(chatId);
+    }
+  }
+
+  openTabs() {
+    if (!this.tabsInitialized && this.store) {
+      this.recentChats = this.store.recentChats(30);
+      this.syncOpenTabs();
+    }
+    const byId = new Map((this.recentChats || []).map((chat) => [chat.id, chat]));
+    if (this.chat) byId.set(this.chat.id, this.chat);
+    const tabs = [];
+    for (const id of this.openTabIds || []) {
+      const chat = byId.get(id);
+      if (chat) tabs.push(chat);
+    }
+    if (this.chat && !tabs.some((tab) => tab.id === this.chat.id)) {
+      tabs.unshift(this.chat);
+    }
+    return tabs;
+  }
+
+  closeTab(chatId) {
+    if (this.running) {
+      this.setFlash('Wait for the current turn to finish.', 'warning');
+      return false;
+    }
+    if (!this.closedTabIds) this.closedTabIds = new Set();
+    const index = (this.openTabIds || []).indexOf(chatId);
+    if (index === -1 && this.chat?.id !== chatId) return false;
+    this.closedTabIds.add(chatId);
+    this.openTabIds = (this.openTabIds || []).filter((id) => id !== chatId);
+    if (this.chat?.id === chatId) {
+      const nextId = this.openTabIds[Math.min(Math.max(0, index), this.openTabIds.length - 1)] || null;
+      if (nextId) {
+        this.loadChat(nextId, { silent: true });
+      } else {
+        this.chat = null;
+        this.messages = [];
+        this.todos = [];
+        this.goal = null;
+        this.registry?.setChat(null);
+        this.transcriptCache.clear();
+        this.scrollOffset = 0;
+        this.followBottom = true;
+      }
+    }
+    this.setToast('Tab closed · /chats to reopen', 'accent');
+    this.requestRender();
+    return true;
+  }
+
+  switchTabByDelta(delta) {
+    if (this.running) {
+      this.setFlash('Wait for the current turn to finish.', 'warning');
+      return false;
+    }
+    const tabs = this.openTabs();
+    if (tabs.length < 2) return false;
+    const currentIndex = Math.max(0, tabs.findIndex((tab) => tab.id === this.chat?.id));
+    const next = tabs[(currentIndex + delta + tabs.length) % tabs.length];
+    if (!next || next.id === this.chat?.id) return false;
+    this.loadChat(next.id, { silent: true });
+    return true;
+  }
+
+  switchTabByIndex(zeroBasedIndex) {
+    if (this.running) {
+      this.setFlash('Wait for the current turn to finish.', 'warning');
+      return false;
+    }
+    const tabs = this.openTabs();
+    const target = tabs[zeroBasedIndex];
+    if (!target || target.id === this.chat?.id) return false;
+    this.loadChat(target.id, { silent: true });
+    return true;
+  }
+
+  deleteChatById(chatId) {
+    if (this.running) {
+      this.setFlash('Wait for the current turn to finish.', 'warning');
+      return;
+    }
+    const target = this.store.findChat(chatId);
+    if (!target) return;
+    this.confirm(`Delete "${truncate(target.title, 50)}" and its messages?`, () => {
+      const goalKey = this.goalStoreKey(target.id);
+      if (goalKey) this.store.setSetting(goalKey, '');
+      this.store.deleteChat(target.id);
+      this.openTabIds = (this.openTabIds || []).filter((id) => id !== target.id);
+      this.closedTabIds?.delete(target.id);
+      if (this.chat?.id === target.id) {
+        this.chat = null;
+        this.messages = [];
+        this.todos = [];
+        this.goal = null;
+        this.registry?.setChat(null);
+        const nextId = this.openTabIds[0] || this.store.recentChats(1)[0]?.id || null;
+        if (nextId) this.loadChat(nextId, { silent: true });
+      }
+      this.refreshSidebar();
+      this.transcriptCache.clear();
+      this.requestRender();
+      this.setToast('Chat deleted.', 'success');
+    });
+  }
+
+  hoverKeyFor(hit) {
+    if (!hit || !hit.type) return '';
+    return `${hit.type}:${hit.id ?? hit.key ?? hit.tab ?? hit.index ?? hit.text ?? hit.command ?? ''}`;
+  }
+
+  isHovered(key) {
+    return Boolean(key && this.hoverHit?.key === key);
+  }
+
+  openPlanPage() {
+    this.setToast('Opening gatita.tech/api#plan…', 'accent');
+    Promise.resolve()
+      .then(() => this.openUrl(PLAN_URL))
+      .catch(() => {
+        this.setFlash(`Open ${PLAN_URL} in your browser.`, 'info');
+      });
+  }
+
+  cycleReasoning() {
+    const model = this.model();
+    const levels = model?.reasoningLevels || [];
+    if (!levels.length) {
+      this.setFlash(`${model?.name || 'This model'} has no reasoning levels.`, 'warning');
+      return false;
+    }
+    const idx = levels.indexOf(this.reasoning);
+    const next = levels[(idx + 1) % levels.length];
+    return this.setReasoning(next);
   }
 
   goalStoreKey(chatId = this.chat?.id) {
@@ -408,7 +640,9 @@ export class App {
       return false;
     }
     this.chat = chat;
+    this.ensureTabOpen(chat.id);
     this.messages = this.store.listMessages(chat.id);
+    this.lastPromptTokens = 0;
     this.todos = this.store.listTodos(chat.id);
     this.loadGoal(chat.id);
     this.cwd = chat.cwd || this.cwd;
@@ -439,7 +673,9 @@ export class App {
       cwd,
     });
     this.chat = chat;
+    this.ensureTabOpen(chat.id);
     this.messages = [];
+    this.lastPromptTokens = 0;
     this.todos = [];
     this.goal = null;
     this.registry?.setChat(chat.id);
@@ -954,6 +1190,7 @@ export class App {
         goal: this.goal?.status === 'active' ? this.goal : null,
         tasks: this.tasks,
         takeSteering: () => this.drainSteering(),
+        initialPromptTokens: this.lastPromptTokens,
         extraPrompt: mentionedPrompt,
         approve: (request) => this.requestApproval(request),
         signal: this.abortController.signal,
@@ -972,6 +1209,7 @@ export class App {
       this.lastError = String(error?.message || error || 'Something went wrong.');
     } finally {
       this.running = false;
+      this.compacting = false;
       this.abortController = null;
       this.stream = { active: false, text: '', reasoning: '', startedAt: 0, awaiting: false };
       this.activeTool = null;
@@ -1072,6 +1310,21 @@ export class App {
       case 'usage':
         this.lastTurnUsage = event.totals;
         this.sessionTokens += Number(event.usage?.totalTokens || 0);
+        if (Number(event.usage?.promptTokens) > 0) {
+          this.lastPromptTokens = Number(event.usage.promptTokens);
+        }
+        break;
+      case 'compacting':
+        this.compacting = true;
+        break;
+      case 'compacted':
+        this.compacting = false;
+        this.lastPromptTokens = 0;
+        if (this.chat) {
+          this.messages = this.store.listMessages(this.chat.id);
+          this.transcriptCache.clear();
+        }
+        this.setToast(`Compacted · ${event.compactedCount || 0} earlier messages summarized`, 'accent');
         break;
       case 'steering':
         // Agent drained the steering queue: refresh the transcript so the new
@@ -1327,11 +1580,316 @@ export class App {
   }
 
   toggleTheme() {
-    this.config.theme = this.config.theme === 'paper' ? 'dark' : 'paper';
+    const current = this.config.theme || 'dark';
+    const index = THEME_NAMES.indexOf(current);
+    const next = THEME_NAMES[(index + 1 + THEME_NAMES.length) % THEME_NAMES.length];
+    this.config.theme = next;
     saveConfig(this.config);
-    this.styler = createStyler(this.config.theme, { enabled: true });
+    this.styler = createStyler(next, { enabled: true });
     this.transcriptCache.clear();
-    this.setFlash(`Theme: ${this.config.theme}.`, 'success');
+    this.setFlash(`Theme: ${next} (${THEME_LABELS[next] || next}).`, 'success');
+  }
+
+  toggleAnimations() {
+    const next = this.config.animations === false;
+    this.config.animations = next;
+    saveConfig(this.config);
+    this.requestRender();
+    this.setFlash(`Animations ${next ? 'on' : 'off'}.`, 'success');
+  }
+
+  paletteTabs() {
+    return [
+      { id: 'quick', label: 'Quick' },
+      { id: 'commands', label: 'Commands' },
+      { id: 'models', label: 'Models' },
+      { id: 'themes', label: 'Themes' },
+      { id: 'chats', label: 'Chats' },
+    ];
+  }
+
+  openPalette(tab = 'quick') {
+    if (this.approval) return;
+    this.openDialog({ type: 'palette', filter: '', index: 0, tab });
+  }
+
+  paletteItems(filter = '', tab = 'quick') {
+    const term = String(filter || '').trim().toLowerCase();
+    const commandItems = SLASH_COMMANDS
+      .filter((cmd) => cmd.name !== 'palette')
+      .map((cmd) => ({
+        kind: 'command',
+        section: 'COMMANDS',
+        id: cmd.name,
+        label: `/${cmd.name}`,
+        detail: cmd.description,
+        hint: cmd.aliases?.length ? `/${cmd.aliases[0]}` : '',
+        search: `${cmd.name} ${(cmd.aliases || []).join(' ')} ${cmd.description}`.toLowerCase(),
+      }));
+    const modelItems = (this.models || []).map((model) => ({
+      kind: 'model',
+      section: 'MODELS',
+      id: model.id,
+      label: `model: ${model.name}`,
+      displayLabel: model.name,
+      active: model.id === this.modelId,
+      detail: model.available
+        ? (model.description || `${formatTokens(model.contextWindow)} ctx`)
+        : `locked (${model.requiredPlan})`,
+      hint: model.id === this.modelId ? 'active' : formatTokens(model.contextWindow),
+      search: `model ${model.id} ${model.name} ${model.description || ''}`.toLowerCase(),
+    }));
+    const themeItems = THEME_NAMES.map((theme) => ({
+      kind: 'theme',
+      section: 'THEMES',
+      id: theme,
+      label: `theme: ${theme}`,
+      displayLabel: theme,
+      active: (this.config.theme || 'dark') === theme,
+      detail: THEME_LABELS[theme] || theme,
+      hint: (this.config.theme || 'dark') === theme ? 'active' : '',
+      search: `theme ${theme} ${THEME_LABELS[theme] || ''}`.toLowerCase(),
+    }));
+    const chatItems = (this.recentChats || []).slice(0, 12).map((chat) => ({
+      kind: 'session',
+      section: 'CHATS',
+      id: chat.id,
+      label: `chat: ${truncate(chat.title, 36)}`,
+      displayLabel: truncate(chat.title, 36),
+      active: chat.id === this.chat?.id,
+      detail: `${chat.messageCount || 0} msg`,
+      hint: chat.updatedAt ? `${formatDuration(Math.max(0, Date.now() - chat.updatedAt), { compact: true })} ago` : '',
+      search: `chat session resume ${chat.title}`.toLowerCase(),
+    }));
+
+    if (term) {
+      const all = [...commandItems, ...modelItems, ...themeItems, ...chatItems];
+      return all
+        .filter((item) => item.search.includes(term))
+        .sort((a, b) => {
+          const rank = (item) => {
+            const id = String(item.id || '').toLowerCase();
+            const lbl = String(item.label || '').toLowerCase();
+            if (id === term || lbl === term || lbl === `/${term}`) return 0;
+            if (id.startsWith(term) || lbl.startsWith(term) || lbl.startsWith(`/${term}`)) return 1;
+            if (lbl.includes(term)) return 2;
+            return 3;
+          };
+          return rank(a) - rank(b);
+        });
+    }
+
+    if (tab === 'commands') return commandItems;
+    if (tab === 'models') return modelItems;
+    if (tab === 'themes') return themeItems;
+    if (tab === 'chats') return chatItems;
+
+    // Default 'quick' tab: focused, uncluttered high-frequency actions + top recent chats.
+    const quickActions = [
+      {
+        kind: 'command',
+        section: 'ACTIONS',
+        id: 'new',
+        label: 'New chat tab',
+        displayLabel: 'New chat tab',
+        detail: 'Start a fresh conversation',
+        hint: '/new',
+      },
+      {
+        kind: 'command',
+        section: 'ACTIONS',
+        id: 'chats',
+        label: 'Browse all chats',
+        displayLabel: 'Browse all chats',
+        detail: `${(this.recentChats || []).length} saved`,
+        hint: '/chats',
+      },
+      {
+        kind: 'command',
+        section: 'ACTIONS',
+        id: 'model',
+        label: 'Switch model',
+        displayLabel: 'Switch model',
+        detail: this.model()?.name || this.modelId,
+        hint: '/model',
+      },
+      {
+        kind: 'action',
+        section: 'ACTIONS',
+        id: 'toggle-plan',
+        label: this.mode === 'plan' ? 'Switch to Build mode' : 'Switch to Plan mode',
+        displayLabel: this.mode === 'plan' ? 'Switch to Build mode' : 'Switch to Plan mode',
+        detail: this.mode === 'plan' ? 'Allow edits and shell tools' : 'Ask clarifying questions first',
+        hint: this.mode === 'plan' ? '/build' : '/plan',
+      },
+      {
+        kind: 'command',
+        section: 'ACTIONS',
+        id: 'usage',
+        label: 'Usage & quota',
+        displayLabel: 'Usage & quota',
+        detail: 'Inspect limits and recent usage',
+        hint: '/usage',
+      },
+      {
+        kind: 'action',
+        section: 'ACTIONS',
+        id: 'open-plan',
+        label: 'Manage plan online',
+        displayLabel: 'Manage plan online',
+        detail: 'gatita.tech/api#plan',
+        hint: '↗',
+      },
+      {
+        kind: 'command',
+        section: 'ACTIONS',
+        id: 'cwd',
+        label: 'Working directory',
+        displayLabel: 'Working directory',
+        detail: formatCwdForDisplay(this.cwd, 28),
+        hint: '/cwd',
+      },
+      {
+        kind: 'command',
+        section: 'ACTIONS',
+        id: 'settings',
+        label: 'Settings',
+        displayLabel: 'Settings',
+        detail: `Theme: ${this.config.theme || 'dark'}`,
+        hint: '/settings',
+      },
+    ];
+    const recentQuick = chatItems
+      .filter((item) => item.id !== this.chat?.id)
+      .slice(0, 3)
+      .map((item) => ({ ...item, section: 'RECENT CHATS' }));
+    return [...quickActions, ...recentQuick];
+  }
+
+  executePaletteItem(item) {
+    if (!item) return;
+    this.closeDialog();
+    if (item.kind === 'action') {
+      if (item.id === 'toggle-plan') this.togglePlanMode();
+      else if (item.id === 'open-plan') this.openPlanPage();
+      return;
+    }
+    if (item.kind === 'command') {
+      void this.executeSlash(`/${item.id}`);
+      return;
+    }
+    if (item.kind === 'model') {
+      this.setModel(item.id);
+      return;
+    }
+    if (item.kind === 'theme') {
+      this.config.theme = item.id;
+      saveConfig(this.config);
+      this.styler = createStyler(item.id, { enabled: true });
+      this.transcriptCache.clear();
+      this.requestRender();
+      this.setFlash(`Theme: ${item.id}.`, 'success');
+      return;
+    }
+    if (item.kind === 'session') {
+      if (this.running) {
+        this.setFlash('Wait for the current turn to finish.', 'warning');
+        return;
+      }
+      const title = item.displayLabel || item.label.replace(/^chat:\s*/, '');
+      if (this.loadChat(item.id)) this.setFlash(`Resumed ${truncate(title, 40)}.`, 'success');
+    }
+  }
+
+  openLoginDialog({ mode = 'credentials' } = {}) {
+    if (this.running) {
+      this.setFlash('Wait for the current turn to finish before switching accounts.', 'warning');
+      return;
+    }
+    const currentEmail = this.me?.user?.email || '';
+    const view = new LoginView({
+      serverUrl: this.config.serverUrl,
+      theme: this.config.theme || 'dark',
+      animations: this.config.animations !== false,
+      initialEmail: currentEmail,
+      initialMode: mode === 'token' ? 'token' : 'credentials',
+      readClipboard: () => this.clipboard.read(),
+      onCancel: () => {
+        this.stopAnimation();
+        this.closeDialog();
+      },
+      onComplete: () => {
+        this.stopAnimation();
+        this.closeDialog();
+      },
+      onSubmit: async (data, signal) => {
+        this.startAnimation();
+        this.requestRender();
+        try {
+          let nextClient;
+          let payload;
+          if (data.mode === 'token') {
+            nextClient = createApiClient({ serverUrl: this.config.serverUrl, token: data.token });
+            const me = await nextClient.me({ timeoutMs: 15_000, signal });
+            payload = { ...me, token: data.token, expiresAt: null };
+            saveStoredAuth(this.config.serverUrl, {
+              token: data.token,
+              expiresAt: null,
+              email: me?.user?.email || '',
+              displayName: me?.user?.displayName || '',
+              plan: me?.plan?.id || me?.user?.plan || 'free',
+            });
+          } else {
+            nextClient = createApiClient({ serverUrl: this.config.serverUrl, token: '' });
+            payload = await nextClient.login(data.email, data.password, { signal });
+            saveStoredAuth(this.config.serverUrl, {
+              token: payload.token,
+              expiresAt: payload.expiresAt,
+              email: payload.user?.email || data.email,
+              displayName: payload.user?.displayName || '',
+              plan: payload.plan?.id || payload.user?.plan || 'free',
+            });
+          }
+          const [me, models] = await Promise.all([
+            data.mode === 'token' ? payload : nextClient.me({ timeoutMs: 15_000, signal }).catch(() => payload),
+            nextClient.models({ timeoutMs: 15_000, signal }).catch(() => ({ data: this.models, defaultModel: this.defaultModel })),
+          ]);
+          this.client = nextClient;
+          this.me = me;
+          this.plan = me?.plan || this.plan;
+          this.quota = me?.quota || this.quota;
+          this.models = models?.data || this.models;
+          this.defaultModel = models?.defaultModel || this.defaultModel;
+          this.online = true;
+          this.ensureValidModel();
+          this.stopAnimation();
+          this.closeDialog();
+          const who = me?.user?.displayName || me?.user?.email || 'account';
+          const planLabel = me?.plan?.displayName || 'Free';
+          this.setToast(`Signed in as ${who} (${planLabel})`, 'success');
+          this.requestRender();
+        } catch (error) {
+          if (signal.aborted) return;
+          view.submitting = false;
+          const status = Number(error?.status || 0);
+          const message = error instanceof ApiError
+            ? error.message
+            : 'Could not reach the Gatita server. Check your connection.';
+          if (status === 401 && data.mode === 'credentials') {
+            view.password = '';
+            view.passwordCursor = 0;
+            view.focus = 'password';
+          }
+          view.setError(message, {
+            tone: status === 429 ? 'warning' : 'danger',
+            retryAfter: error?.retryAfter || 0,
+          });
+          this.requestRender();
+        }
+      },
+    });
+    view.setServerStatus(this.online ? 'online' : 'offline');
+    this.openDialog({ type: 'login', view });
   }
 
   scrollBy(delta) {
@@ -1345,6 +1903,11 @@ export class App {
 
   handleKey(key) {
     if (key.name === 'paste') {
+      if (this.dialog?.type === 'login' && !this.approval) {
+        this.dialog.view.handleKey(key);
+        this.requestRender();
+        return;
+      }
       const askOpen = this.dialog?.type === 'ask' && this.dialog.otherOpen && !this.approval;
       if (this.approval) return;
       if (this.dialog && !askOpen) return;
@@ -1364,10 +1927,23 @@ export class App {
       return;
     }
     if (key.name === 'mouse') {
+      if (this.dialog?.type === 'login') {
+        const offsetRow = Number(key.row) - (this.headerHeight || 3);
+        if (offsetRow >= 1) {
+          this.dialog.view.handleKey({ ...key, row: offsetRow });
+          this.requestRender();
+        }
+        return;
+      }
       this.handleMouse(key);
       return;
     }
     if (key.ctrl && key.text === 'c') {
+      if (this.dialog?.type === 'login') {
+        this.dialog.view.handleKey(key);
+        this.requestRender();
+        return;
+      }
       if (this.approval) {
         this.finishApproval(false, { abort: true });
         return;
@@ -1398,7 +1974,17 @@ export class App {
       this.requestRender();
       return;
     }
+    if (key.ctrl && key.text === 'p' && !this.approval) {
+      if (this.dialog?.type === 'palette') this.closeDialog();
+      else if (!this.dialog) this.openPalette();
+      return;
+    }
     if (key.ctrl && key.text === 'v') {
+      if (this.dialog?.type === 'login') {
+        this.dialog.view.handleKey(key);
+        this.requestRender();
+        return;
+      }
       if (!this.approval) this.pasteFromClipboard();
       return;
     }
@@ -1438,6 +2024,18 @@ export class App {
     }
     if (key.ctrl && key.text === 'r') {
       this.toggleThinking();
+      return;
+    }
+    if (key.alt && key.name === 'left') {
+      this.switchTabByDelta(-1);
+      return;
+    }
+    if (key.alt && key.name === 'right') {
+      this.switchTabByDelta(1);
+      return;
+    }
+    if (key.alt && key.name === 'char' && /^[1-9]$/.test(String(key.text || ''))) {
+      this.switchTabByIndex(Number(key.text) - 1);
       return;
     }
     if (key.name === 'm' && !key.ctrl && !key.alt && !this.dialog && !this.approval && !this.running) {
@@ -1596,7 +2194,7 @@ export class App {
 
   composerTextWidth() {
     const inner = Math.max(8, (this.terminal?.columns || 80) - 2);
-    return Math.max(4, inner - 2);
+    return Math.max(4, inner - 4);
   }
 
   moveLine(direction) {
@@ -1772,13 +2370,89 @@ export class App {
       { key: 'thinking', label: 'thinking', value: onOff(this.thinkingExpanded()), toggle: () => this.toggleThinking() },
       { key: 'work', label: 'work details', value: onOff(this.showWork), toggle: () => this.toggleWork() },
       { key: 'sound', label: 'sounds', value: onOff(this.config.sounds !== false), toggle: () => this.toggleSound() },
-      { key: 'theme', label: 'theme', value: this.config.theme || 'dark', toggle: () => this.toggleTheme() },
+      { key: 'animations', label: 'animations', value: onOff(this.config.animations !== false), toggle: () => this.toggleAnimations() },
+      { key: 'theme', label: 'theme', value: this.config.theme || 'dark', detail: THEME_LABELS[this.config.theme || 'dark'] || '', toggle: () => this.toggleTheme() },
       { key: 'permissions', label: 'tool approvals', value: 'open', toggle: () => this.openDialog({ type: 'permissions', index: 0 }) },
+      { key: 'account', label: 'switch account', value: this.me?.user?.email || 'sign in', toggle: () => this.openLoginDialog() },
     ];
   }
 
   openSettings() {
     this.openDialog({ type: 'settings', index: 0 });
+  }
+
+  openWorkspaceDialog() {
+    this.openDialog({ type: 'workspace' });
+  }
+
+  openContextDialog() {
+    this.openDialog({ type: 'context' });
+  }
+
+  contextMetrics() {
+    return computeContextMetrics({
+      history: this.messages || [],
+      model: this.model(),
+      lastPromptTokens: this.lastPromptTokens,
+    });
+  }
+
+  async compactCurrentChat() {
+    if (!this.chat) {
+      this.setFlash('No chat is open. Send a message or run /new.', 'warning');
+      return false;
+    }
+    if (this.running) {
+      this.setFlash('Wait for Gatita to finish first.', 'warning');
+      return false;
+    }
+    const model = this.model();
+    this.running = true;
+    this.compacting = true;
+    this.abortController = new AbortController();
+    this.startAnimation();
+    this.setFlash('Compacting conversation…', 'info');
+    this.requestRender();
+    try {
+      const result = await compactConversation({
+        api: this.client,
+        store: this.store,
+        chat: this.chat,
+        cwd: this.cwd,
+        model,
+        plan: this.plan?.id || 'free',
+        registry: this.registry,
+        auto: false,
+        signal: this.abortController.signal,
+      });
+      if (result.skipped) {
+        this.setFlash('This conversation is already short.', 'muted');
+        return false;
+      }
+      this.lastPromptTokens = 0;
+      this.messages = this.store.listMessages(this.chat.id);
+      this.todos = this.store.listTodos(this.chat.id);
+      this.transcriptCache.clear();
+      this.followBottom = true;
+      this.scrollOffset = 0;
+      this.refreshSidebar();
+      this.setFlash(`Compacted ${result.compactedCount} earlier messages. Full history remains visible above.`, 'success');
+      this.requestRender();
+      return true;
+    } catch (error) {
+      if (error?.code === 'aborted' || this.abortController?.signal?.aborted) {
+        this.setFlash('Compaction cancelled.', 'warning');
+        return false;
+      }
+      this.setFlash(error?.message || 'Could not compact conversation.', 'danger');
+      return false;
+    } finally {
+      this.running = false;
+      this.compacting = false;
+      this.abortController = null;
+      this.stopAnimation();
+      this.requestRender();
+    }
   }
 
   toggleWork() {
@@ -2107,15 +2781,27 @@ export class App {
 
   handleMouse(key) {
     const { button, press, row, column } = key;
+    // Hover motion without a button held (reported as button 35 with SGR 1003).
+    if (button === 35) {
+      const index = Number(row) - 1;
+      const hit = this.hitAtColumn(this.hitRegions?.[index], column);
+      const nextKey = hit ? this.hoverKeyFor(hit) : '';
+      const prevKey = this.hoverHit?.key || '';
+      if (nextKey !== prevKey) {
+        this.hoverHit = nextKey ? { row: index, key: nextKey } : null;
+        this.requestRender();
+      }
+      return;
+    }
     if (button === 64 || button === 65) {
       const direction = button === 64 ? 1 : -1;
       if (this.dialog) {
         // List dialogs move selection; scrollable dialogs scroll their body
-        if (this.dialog.type === 'models' || this.dialog.type === 'sessions' || this.dialog.type === 'permissions' || this.dialog.type === 'folders') {
+        if (['models', 'sessions', 'permissions', 'folders', 'settings', 'palette'].includes(this.dialog.type)) {
           this.dialog.index = Math.max(0, (this.dialog.index || 0) - direction * 1);
           const count = this.dialogItemCount(this.dialog);
           this.dialog.index = Math.min(Math.max(0, count - 1), this.dialog.index);
-        } else if (['usage', 'text', 'help', 'plan'].includes(this.dialog.type)) {
+        } else if (['usage', 'text', 'help', 'plan', 'tasks'].includes(this.dialog.type)) {
           this.dialog.scroll = Math.max(0, (this.dialog.scroll || 0) - direction * 2);
         }
         this.requestRender();
@@ -2216,11 +2902,124 @@ export class App {
           this.chat = this.store.getChat(this.chat.id) || this.chat;
         }
         this.refreshSidebar();
+        if (this.dialog?.type === 'folders') this.closeDialog();
         this.setFlash(hit.id ? 'Folder selected.' : 'Showing all chats.', 'success');
         return;
       }
       case 'new-chat':
+        if (this.dialog) this.closeDialog();
         this.newChat({ folderId: this.config.lastFolderId || null, cwd: this.cwd });
+        return;
+      case 'close-tab':
+        this.closeTab(hit.id);
+        return;
+      case 'open-chats':
+        this.openDialog({ type: 'sessions', index: 0, filter: '' });
+        return;
+      case 'delete-chat':
+        this.deleteChatById(hit.id);
+        return;
+      case 'open-plan':
+        this.openPlanPage();
+        return;
+      case 'open-update':
+        void this.executeSlash('/update');
+        return;
+      case 'open-help':
+        this.openDialog({ type: 'help', scroll: 0 });
+        return;
+      case 'open-tasks':
+        this.openDialog({ type: 'tasks', scroll: 0 });
+        return;
+      case 'open-workspace':
+        this.openWorkspaceDialog();
+        return;
+      case 'open-context':
+        this.openContextDialog();
+        return;
+      case 'run-compact':
+        this.closeDialog();
+        void this.compactCurrentChat();
+        return;
+      case 'change-cwd':
+        this.closeDialog();
+        this.promptInput({
+          title: 'change working directory',
+          value: this.cwd,
+          hint: 'enter path · esc cancel',
+          onSubmit: (nextDir) => {
+            if (nextDir) void this.setCwd(nextDir);
+          },
+        });
+        return;
+      case 'copy-cwd':
+        Promise.resolve()
+          .then(() => this.clipboard.write(this.cwd))
+          .then(() => this.setToast('Working directory copied.', 'success'))
+          .catch((error) => this.setFlash(`Clipboard failed: ${error?.message || error}`, 'danger'));
+        return;
+      case 'cycle-reasoning':
+        this.cycleReasoning();
+        return;
+      case 'send-or-stop':
+        if (this.running) {
+          this.abortController?.abort();
+          this.setFlash('Stopping…', 'warning');
+        } else if (this.input.trim()) {
+          this.submitInput();
+        }
+        return;
+      case 'close-dialog':
+        if (this.approval) this.finishApproval(false, { abort: true });
+        else this.closeDialog();
+        return;
+      case 'approval-allow':
+        this.finishApproval(true);
+        return;
+      case 'approval-always':
+        this.finishApproval(true, { remember: true });
+        return;
+      case 'approval-deny':
+        this.finishApproval(false);
+        return;
+      case 'confirm-yes': {
+        const current = this.dialog;
+        if (current?.type === 'confirm') {
+          this.dialog = null;
+          this.requestRender();
+          current.resolve?.(true);
+        }
+        return;
+      }
+      case 'confirm-no': {
+        const current = this.dialog;
+        if (current?.type === 'confirm') {
+          this.dialog = null;
+          this.requestRender();
+          current.resolve?.(false);
+        }
+        return;
+      }
+      case 'plan-build':
+        this.acceptPlan();
+        return;
+      case 'plan-keep':
+        if (this.dialog?.type === 'plan') {
+          this.dialog = null;
+          this.requestRender();
+        }
+        return;
+      case 'use-banked-reset':
+        this.closeDialog();
+        void this.useBankedReset();
+        return;
+      case 'palette-tab':
+        if (this.dialog?.type === 'palette') {
+          this.dialog.tab = hit.tab || 'quick';
+          this.dialog.filter = '';
+          this.dialog.index = 0;
+          this.requestRender();
+        }
         return;
       case 'use-plan':
         this.acceptPlan();
@@ -2239,6 +3038,32 @@ export class App {
         return;
       case 'open-settings':
         this.openSettings();
+        return;
+      case 'open-models':
+        this.openDialog({ type: 'models', index: 0, filter: '' });
+        return;
+      case 'open-login':
+        this.openLoginDialog();
+        return;
+      case 'open-palette':
+        this.openPalette();
+        return;
+      case 'palette-item':
+        this.executePaletteItem(hit.item);
+        return;
+      case 'scroll-bottom':
+        this.scrollOffset = 0;
+        this.followBottom = true;
+        this.requestRender();
+        return;
+      case 'starter-prompt':
+        if (hit.command) {
+          void this.executeSlash(hit.command);
+        } else if (hit.text) {
+          this.input = hit.text;
+          this.cursor = this.input.length;
+          this.requestRender();
+        }
         return;
       case 'setting': {
         if (this.dialog?.type !== 'settings') return;
@@ -2505,6 +3330,9 @@ export class App {
       const filter = String(dialog.filter || '').toLowerCase();
       return this.recentChats.filter((chat) => !filter || chat.title.toLowerCase().includes(filter));
     }
+    if (dialog.type === 'palette') {
+      return this.paletteItems(dialog.filter || '', dialog.tab || 'quick');
+    }
     if (dialog.type === 'permissions') {
       return ['edit', 'write', 'shell', 'web', 'computer', 'mcp', 'plugin'];
     }
@@ -2522,6 +3350,11 @@ export class App {
   handleDialogKey(key) {
     const dialog = this.dialog;
     if (!dialog) return;
+    if (dialog.type === 'login') {
+      dialog.view.handleKey(key);
+      this.requestRender();
+      return;
+    }
     if (dialog.type === 'ask') {
       this.handleAskKey(key);
       return;
@@ -2577,7 +3410,28 @@ export class App {
       if (key.name === 'pagedown') { dialog.scroll = (dialog.scroll || 0) + 8; this.requestRender(); return; }
       return;
     }
-    if (dialog.type === 'help' || dialog.type === 'usage' || dialog.type === 'text') {
+    if (dialog.type === 'context') {
+      const letter = (key.name === 'char' || key.name === 'text') ? String(key.text || '').toLowerCase() : '';
+      if (key.name === 'escape' || key.name === 'enter') {
+        this.closeDialog();
+      } else if (letter === 'c') {
+        this.closeDialog();
+        void this.compactCurrentChat();
+      }
+      return;
+    }
+    if (dialog.type === 'workspace') {
+      const letter = (key.name === 'char' || key.name === 'text') ? String(key.text || '').toLowerCase() : '';
+      if (key.name === 'escape' || key.name === 'enter') {
+        this.closeDialog();
+      } else if (letter === 'c') {
+        this.invokeHitRegion({ type: 'change-cwd' }, 1);
+      } else if (letter === 'y') {
+        this.invokeHitRegion({ type: 'copy-cwd' }, 1);
+      }
+      return;
+    }
+    if (dialog.type === 'help' || dialog.type === 'usage' || dialog.type === 'text' || dialog.type === 'tasks') {
       if (key.name === 'escape' || key.name === 'enter') this.closeDialog();
       else if (key.name === 'up') { dialog.scroll = Math.max(0, (dialog.scroll || 0) - 1); this.requestRender(); }
       else if (key.name === 'down') { dialog.scroll = (dialog.scroll || 0) + 1; this.requestRender(); }
@@ -2619,7 +3473,22 @@ export class App {
       }
       return;
     }
-    if (dialog.type === 'models' || dialog.type === 'sessions') {
+    if (dialog.type === 'models' || dialog.type === 'sessions' || dialog.type === 'palette') {
+      if (dialog.type === 'palette' && (key.name === 'tab' || ((!dialog.filter) && (key.name === 'left' || key.name === 'right')))) {
+        const tabs = this.paletteTabs();
+        const cur = Math.max(0, tabs.findIndex((t) => t.id === (dialog.tab || 'quick')));
+        const delta = key.name === 'left' || key.shift ? -1 : 1;
+        dialog.tab = tabs[(cur + delta + tabs.length) % tabs.length].id;
+        dialog.index = 0;
+        this.requestRender();
+        return;
+      }
+      if (dialog.type === 'sessions' && !dialog.filter && (key.name === 'delete' || ((key.name === 'char' || key.name === 'text') && String(key.text || '').toLowerCase() === 'd'))) {
+        const items = this.dialogItems(dialog);
+        const item = items[dialog.index || 0];
+        if (item) this.deleteChatById(item.id);
+        return;
+      }
       if (key.name === 'text' || key.name === 'char') {
         dialog.filter = `${dialog.filter || ''}${key.text}`;
         dialog.index = 0;
@@ -2632,7 +3501,9 @@ export class App {
         const items = this.dialogItems(dialog);
         const item = items[dialog.index || 0];
         if (!item) return;
-        if (dialog.type === 'models') {
+        if (dialog.type === 'palette') {
+          this.executePaletteItem(item);
+        } else if (dialog.type === 'models') {
           this.closeDialog();
           this.setModel(item.id);
         } else {
@@ -2729,64 +3600,93 @@ export class App {
     const cols = this.terminal.columns;
     const rows = this.terminal.rows;
     this.hitRegions = new Array(rows).fill(null);
-    const status = this.renderStatus(cols);
-    const header = [this.renderHeader(cols), this.styler.fg('border', '─'.repeat(cols))];
-    const composerHits = [];
-    const composer = this.renderComposer(cols, composerHits);
-    for (let index = 0; index < composerHits.length; index += 1) {
-      if (composerHits[index]) this.addHit(rows - composer.length + index, composerHits[index]);
+    if (this.dialog?.type === 'login' && this.dialog.view) {
+      this.dialog.view.tick = this.animationTick;
     }
+    const statusHits = [];
+    const status = this.renderStatus(cols, statusHits);
+    const headerHits = [];
+    const tabHits = [];
+    const headerRow = this.renderHeader(cols, headerHits);
+    const tabBarRows = this.renderTabBar(cols, tabHits);
+    const header = [headerRow, ...tabBarRows];
+    this.headerHeight = header.length;
+    if (headerHits.length) this.addHit(0, headerHits);
+    if (tabHits.length) this.addHit(1, tabHits);
+    const composerHits = [];
+    const composer = this.renderComposer(cols, composerHits, rows);
     let middleRows = rows - header.length - composer.length - 1;
     if (middleRows < 3) {
       middleRows = Math.max(1, rows - header.length - 1 - 1);
     }
+    const composerStartRow = header.length + middleRows;
+    for (let index = 0; index < composerHits.length; index += 1) {
+      if (composerHits[index]) this.addHit(composerStartRow + index, composerHits[index]);
+    }
     const middle = [];
     const baseRow = header.length;
-    const sidebarWidth = !(this.dialog || this.approval) && cols >= 104
-      ? Math.min(32, Math.max(26, Math.floor(cols * 0.26)))
-      : null;
     const rowRegions = [];
     const tag = (count, regions) => {
       for (let index = 0; index < count; index += 1) rowRegions.push(regions);
     };
-    for (let index = 0; index < header.length; index += 1) {
-      rowRegions.push([{ kind: 'header', col: 0, width: cols }]);
+    rowRegions.push([{ kind: 'header', col: 0, width: cols }]);
+    for (let index = 0; index < tabBarRows.length; index += 1) {
+      rowRegions.push([{ kind: 'tabs', col: 0, width: cols }]);
     }
     if (this.dialog || this.approval) {
       const dialogRows = this.approval
-        ? this.renderApproval(middleRows, cols)
+        ? this.renderApproval(middleRows, cols, (index, hit) => {
+          if (hit) this.addHit(baseRow + index, hit);
+        })
         : (this.dialog ? this.renderDialog(middleRows, cols, (index, hit) => {
           if (hit) this.addHit(baseRow + index, hit);
         }) : []);
       middle.push(...dialogRows);
       tag(dialogRows.length, [{ kind: 'dialog', col: 0, width: cols }]);
-    } else if (sidebarWidth) {
-      const convWidth = cols - sidebarWidth - 1;
-      const sidebarHits = [];
-      const sidebar = this.renderSidebar(middleRows, sidebarWidth, sidebarHits);
-      const conversation = this.renderConversation(middleRows, convWidth);
-      for (let index = 0; index < middleRows; index += 1) {
-        const rowHits = [];
-        if (sidebarHits[index]) rowHits.push(...this.sameRowHits(sidebarHits[index]));
-        const transcriptHit = this.transcriptHits?.get((this.conversationStart || 0) + index);
-        if (transcriptHit) rowHits.push(...this.sameRowHits(transcriptHit).map((entry) => ({ ...entry, col: Number(entry.col ?? 0) + sidebarWidth + 1 })));
-        if (rowHits.length) this.addHit(baseRow + index, rowHits);
-        middle.push(`${sidebar[index] || ''.padEnd(sidebarWidth)}${this.styler.fg('border', '│')}${conversation[index] || ''}`);
-      }
-      tag(middleRows, [{ kind: 'sidebar', col: 0, width: sidebarWidth }, { kind: 'conversation', col: sidebarWidth + 1, width: convWidth }]);
     } else {
-      const conversation = this.renderConversation(middleRows, cols);
+      const convHits = [];
+      const conversation = this.renderConversation(middleRows, cols, convHits);
       middle.push(...conversation);
       for (let index = 0; index < middleRows; index += 1) {
+        const rowHits = [];
+        if (convHits[index]) rowHits.push(...this.sameRowHits(convHits[index]));
         const transcriptHit = this.transcriptHits?.get((this.conversationStart || 0) + index);
-        if (transcriptHit) this.addHit(baseRow + index, transcriptHit);
+        if (transcriptHit) rowHits.push(...this.sameRowHits(transcriptHit));
+        if (rowHits.length) this.addHit(baseRow + index, rowHits);
       }
       tag(middle.length, [{ kind: 'conversation', col: 0, width: cols }]);
+
+      // Floating command/skill suggestions overlay directly over the bottom of the
+      // conversation so typing "/" or "@" never shifts the chat text.
+      const suggestionSet = this.visibleSuggestions();
+      if (suggestionSet?.items?.length && middle.length >= 3) {
+        const overlay = this.renderSuggestionsOverlay(cols, middle.length, suggestionSet);
+        const startIdx = Math.max(0, middle.length - overlay.lines.length);
+        for (let i = 0; i < overlay.lines.length; i += 1) {
+          const targetIdx = startIdx + i;
+          if (targetIdx < 0 || targetIdx >= middle.length) continue;
+          const baseLine = padEndVisible(truncateVisible(middle[targetIdx] || '', cols), cols);
+          const before = sliceVisible(baseLine, 0, overlay.left);
+          const after = sliceVisible(baseLine, overlay.left + overlay.width);
+          middle[targetIdx] = `${before}${overlay.lines[i]}${after}`;
+          const screenRow = baseRow + targetIdx;
+          const existing = this.sameRowHits(this.hitRegions[screenRow]).filter((entry) => {
+            const start = Number(entry?.col ?? 0);
+            const end = start + (Number.isFinite(Number(entry?.width)) ? Number(entry.width) : cols);
+            return end <= overlay.left || start >= overlay.left + overlay.width;
+          });
+          if (overlay.hits[i]) {
+            existing.unshift({ ...overlay.hits[i], col: overlay.left, width: overlay.width });
+          }
+          this.hitRegions[screenRow] = existing.length === 0 ? null : (existing.length === 1 ? existing[0] : existing);
+        }
+      }
     }
     tag(composer.length, [{ kind: 'composer', col: 0, width: cols }]);
     const frame = [...header, ...middle, ...composer];
     while (frame.length < rows - 1) frame.push('');
     frame.push(status);
+    if (statusHits.length) this.addHit(Math.min(rows - 1, frame.length - 1), statusHits);
     // Align regions with the final rows (pad rows belong to conversation).
     while (rowRegions.length < frame.length - 1) rowRegions.push([{ kind: 'conversation', col: 0, width: cols }]);
     rowRegions.push([{ kind: 'status', col: 0, width: cols }]);
@@ -2809,41 +3709,302 @@ export class App {
       const text = ` ${GLYPHS.checked} ${toast.text} `;
       const width = visibleWidth(text);
       const col = Math.max(0, cols - width - 1);
-      const rowIndex = Math.min(2, view.length - 1);
+      const rowIndex = Math.min(this.headerHeight, view.length - 1);
       const line = view[rowIndex] || '';
-      view[rowIndex] = `${sliceVisible(line, 0, col)}${this.styler.bg('surface2', this.styler.fg(toast.color || 'success', text))}${sliceVisible(line, col + width)}`;
+      const tone = toast.color || 'success';
+      const bgTone = tone === 'warning' ? 'warningBg' : tone === 'danger' ? 'dangerBg' : tone === 'accent' ? 'accentBg' : 'successBg';
+      view[rowIndex] = `${sliceVisible(line, 0, col)}${this.styler.bg(bgTone, this.styler.bold(this.styler.fg(tone, text)))}${sliceVisible(line, col + width)}`;
     }
     this.lastFramePlain = view.map((line) => stripAnsi(line));
     return view.map((line) => paintRow(line, this.styler));
   }
 
-  renderHeader(cols) {
+  renderHeader(cols, hits = []) {
     const s = this.styler;
-    const left = [
-      s.fg('accent', GLYPHS.cat),
-      s.bold(s.fg('text', 'GATITA STUDIO')),
-      s.fg('faint', '·'),
-      s.fg('muted', basenameForDisplay(this.cwd)),
-    ].join(' ');
-    const planName = (this.plan?.displayName || 'Free').replace(/^Gatita\s+/i, '');
-    const online = this.online ? s.fg('success', '●') : s.fg('danger', '○');
+    const catGlyph = (this.approval || this.lastError)
+      ? s.fg('warning', GLYPHS.catAlert)
+      : s.fg('accent', GLYPHS.cat);
+
+    // Build clickable right-hand app action buttons first so we know their exact width.
+    const planName = (this.plan?.displayName || 'Free').replace(/^Gatita\s+/i, '').toUpperCase();
+    const planId = String(this.plan?.id || 'free').toLowerCase();
+    const planVariant = planId === 'pro' ? 'plan-pro' : planId === 'plus' ? 'plan-plus' : 'plan-free';
+    const planBtnText = button(s, planName, {
+      variant: planVariant,
+      icon: planId === 'free' ? '' : '✦',
+      trailing: '↗',
+      hovered: this.isHovered('open-plan:'),
+    });
+
     const usage = this.mostRestrictiveWindow();
-    const windowText = usage ? `${formatTokens(usage.remaining)} left` : '';
-    const parts = [
-      online,
-      s.fg('accent', planName.toLowerCase()),
-      windowText ? s.fg('muted', windowText) : '',
-      s.fg('muted', this.model()?.name || this.modelId),
-    ].filter(Boolean);
-    if (this.updateNotice) {
-      parts.push(s.fg('warning', `update: ${this.updateNotice.latest}`));
-    }
+    const usagePct = Number(usage?.percent || 0);
+    const usageVariant = usagePct >= 90 ? 'danger' : usagePct >= 75 ? 'warning' : 'secondary';
+    const usageBtnText = usage
+      ? button(s, formatTokens(usage.remaining), {
+        variant: usageVariant,
+        icon: '◔',
+        hovered: this.isHovered('open-usage:'),
+      })
+      : '';
+
+    const modelName = this.model()?.name || this.modelId;
+    const modelBtnText = button(s, truncateVisible(modelName, cols >= 96 ? 18 : 13), {
+      variant: 'secondary',
+      icon: '◆',
+      trailing: '▾',
+      hovered: this.isHovered('open-models:'),
+    });
+
+    const settingsBtnText = button(s, cols >= 116 ? 'Settings' : '', {
+      variant: 'subtle',
+      icon: '◈',
+      hovered: this.isHovered('open-settings:'),
+    });
+
+    const accountLabel = cols >= 128 && this.me?.user
+      ? truncateVisible(this.me.user.displayName || this.me.user.email || '', 14)
+      : '';
+    const accountBtnText = button(s, accountLabel, {
+      variant: 'subtle',
+      icon: this.online ? s.fg('success', '●') : s.fg('danger', '○'),
+      hovered: this.isHovered('open-login:'),
+    });
+
+    const rightSegments = [];
     if (this.running) {
       const elapsed = this.stream.startedAt ? Date.now() - this.stream.startedAt : 0;
-      parts.unshift(s.fg('accent', `${selectGlyph(SPINNER, this.animationTick)} ${formatDuration(elapsed, { compact: true })}`));
+      const spin = this.config.animations !== false ? selectGlyph(SPINNER, this.animationTick) : GLYPHS.running;
+      rightSegments.push({
+        text: button(s, formatDuration(elapsed, { compact: true }), { variant: 'accent', icon: spin }),
+      });
     }
-    const right = parts.join(s.fg('faint', ' · '));
-    return this.fitRow(` ${left}`, `${right} `, cols);
+    if (this.updateNotice) {
+      rightSegments.push({
+        text: button(s, `update: ${this.updateNotice.latest}`, {
+          variant: 'warning',
+          hovered: this.isHovered('open-update:'),
+        }),
+        hit: { type: 'open-update' },
+      });
+    }
+    rightSegments.push({
+      text: planBtnText,
+      hit: { type: 'open-plan' },
+    });
+    if (usageBtnText && cols >= 82) {
+      rightSegments.push({
+        text: usageBtnText,
+        hit: { type: 'open-usage' },
+      });
+    }
+    rightSegments.push({
+      text: modelBtnText,
+      hit: { type: 'open-models' },
+    });
+    if (cols >= 74) {
+      rightSegments.push({
+        text: settingsBtnText,
+        hit: { type: 'open-settings' },
+      });
+    }
+    if (cols >= 66) {
+      rightSegments.push({
+        text: accountBtnText,
+        hit: { type: 'open-login' },
+      });
+    }
+
+    const rightLayout = placeSegments(rightSegments, { startCol: 0, gap: 1 });
+    const rightCol = Math.max(0, cols - rightLayout.width - 1);
+
+    // Build left-hand brand + obvious clickable working directory + mode badges.
+    const leftSegments = [
+      { text: `${catGlyph} ${s.bold(s.fg('text', cols >= 106 ? 'GATITA STUDIO' : 'GATITA'))}` },
+    ];
+    if (cols >= 122) {
+      leftSegments.push({ text: s.fg('faint', `v${CLIENT_VERSION}`) });
+    }
+    const maxLeftRoom = Math.max(10, rightCol - 2);
+    const modeReserve = (this.mode === 'plan' ? 7 : 0) + (this.goal?.status === 'active' ? 7 : 0);
+    const baseLeftWidth = placeSegments(leftSegments, { startCol: 1, gap: 1 }).width;
+    const cwdRoom = maxLeftRoom - baseLeftWidth - modeReserve - 7;
+    if (cwdRoom >= 6) {
+      const cwdLabel = formatCwdForDisplay(this.cwd, Math.min(38, cwdRoom));
+      leftSegments.push({
+        text: button(s, cwdLabel, {
+          variant: 'secondary',
+          icon: '▤',
+          trailing: '▾',
+          hovered: this.isHovered('open-workspace:'),
+        }),
+        hit: { type: 'open-workspace' },
+      });
+    }
+    if (this.mode === 'plan') {
+      leftSegments.push({
+        text: button(s, 'PLAN', {
+          variant: 'warning',
+          hovered: this.isHovered('toggle-plan:'),
+        }),
+        hit: { type: 'toggle-plan' },
+      });
+    }
+    if (this.goal?.status === 'active') {
+      leftSegments.push({
+        text: badge(s, 'GOAL', { fg: 'accent', bg: 'accentBg', bold: true }),
+      });
+    }
+
+    const leftLayout = placeSegments(leftSegments, { startCol: 1, gap: 1 });
+    const leftStr = truncateVisible(leftLayout.text, Math.max(0, rightCol - 2));
+    const leftFinalWidth = visibleWidth(leftStr);
+    const gapWidth = Math.max(1, rightCol - 1 - leftFinalWidth);
+    const fullLine = ` ${leftStr}${' '.repeat(gapWidth)}${rightLayout.text} `;
+
+    if (hits) {
+      for (const h of leftLayout.hits) {
+        if (h.col + h.width <= 1 + leftFinalWidth) hits.push(h);
+      }
+      for (const h of rightLayout.hits) {
+        hits.push({ ...h, col: rightCol + h.col });
+      }
+    }
+
+    return paintSurface(padEndVisible(truncateVisible(fullLine, cols), cols), s, 'surface');
+  }
+
+  renderTabBar(cols, hits = []) {
+    const s = this.styler;
+    const tabs = this.openTabs();
+    const totalChats = Math.max(tabs.length, (this.recentChats || []).length);
+
+    const newTabBtn = button(s, '+', {
+      variant: 'subtle',
+      hovered: this.isHovered('new-chat:'),
+    });
+    const newTabWidth = visibleWidth(newTabBtn);
+
+    const chatsLabel = totalChats > 0 && cols >= 70 ? `Chats (${totalChats})` : 'Chats';
+    const chatsBtn = button(s, chatsLabel, {
+      variant: 'secondary',
+      icon: '▤',
+      hovered: this.isHovered('open-chats:'),
+    });
+    const chatsWidth = visibleWidth(chatsBtn);
+
+    // Reserve space for: 1 left pad + tabs + 1 gap + [+] + gap + [Chats] + 1 right pad.
+    const reservedRight = newTabWidth + chatsWidth + 4;
+    const availForTabs = Math.max(14, cols - 1 - reservedRight);
+
+    let tabStrip = ' ';
+    let col = 1;
+    let activeSpan = null;
+
+    if (!tabs.length) {
+      // No open tabs yet: show a clean active "New chat" chrome tab connected to the welcome screen.
+      const tabW = Math.min(20, availForTabs);
+      const innerW = Math.max(4, tabW - 4);
+      const titleStr = padEndVisible(truncateVisible('New chat', innerW), innerW);
+      const tabFace = `${s.fg('accent', '●')} ${s.bold(s.fg('text', titleStr))}`;
+      tabStrip += `${s.fg('border', '╭')}${paintSurface(` ${tabFace} `, s, 'ink')}${s.fg('border', '╮')}`;
+      activeSpan = { start: col, width: tabW };
+      col += tabW;
+    } else {
+      const minTabW = cols >= 80 ? 15 : 12;
+      const maxTabW = 24;
+      const maxFit = Math.max(1, Math.floor(availForTabs / minTabW));
+      let activeIndex = tabs.findIndex((t) => t.id === this.chat?.id);
+      if (activeIndex < 0) activeIndex = 0;
+
+      // Window around active tab so it is always visible.
+      let sliceStart = 0;
+      if (tabs.length > maxFit) {
+        sliceStart = Math.max(0, Math.min(tabs.length - maxFit, activeIndex - Math.floor(maxFit / 2)));
+      }
+      const visible = tabs.slice(sliceStart, sliceStart + maxFit);
+      const hiddenCount = Math.max(0, tabs.length - visible.length);
+      const overflowBtn = hiddenCount > 0
+        ? button(s, `+${hiddenCount}`, { variant: 'subtle', hovered: this.isHovered('open-chats:') })
+        : '';
+      const overflowWidth = overflowBtn ? visibleWidth(overflowBtn) + 1 : 0;
+      const tabBudget = Math.max(12, availForTabs - overflowWidth);
+      const tabWidth = Math.max(minTabW, Math.min(maxTabW, Math.floor(tabBudget / visible.length)));
+
+      for (let i = 0; i < visible.length; i += 1) {
+        const tab = visible[i];
+        const isActive = tab.id === this.chat?.id;
+        const tabHovered = this.isHovered(`resume:${tab.id}`);
+        const closeHovered = this.isHovered(`close-tab:${tab.id}`);
+        const isBusy = isActive && this.running;
+        const dot = isBusy
+          ? s.fg('accent', this.config.animations !== false ? selectGlyph(SPINNER, this.animationTick) : GLYPHS.running)
+          : isActive
+            ? s.fg('accent', '●')
+            : s.fg(tabHovered ? 'accent' : 'faint', '○');
+
+        // Active:   ╭ [dot] [title] [×] ╮   -> overhead = 1+1+1+1+1+1+1+1 = 8
+        // Inactive:  [dot] [title] [×] │    -> overhead = 1+1+1+1+1+1+1 = 7
+        const titleBudget = Math.max(3, tabWidth - (isActive ? 8 : 7));
+        const cleanTitle = padEndVisible(truncateVisible(tab.title || 'New chat', titleBudget), titleBudget);
+        const closeGlyph = closeHovered
+          ? paintSurface(s.bold(s.fg('danger', '×')), s, 'dangerBg')
+          : s.fg(isActive ? 'muted' : 'faint', '×');
+
+        if (isActive) {
+          const inner = ` ${dot} ${s.bold(s.fg('text', cleanTitle))} ${closeGlyph} `;
+          const painted = paintSurface(inner, s, 'ink');
+          tabStrip += `${s.fg('accent', '╭')}${painted}${s.fg('accent', '╮')}`;
+          activeSpan = { start: col, width: tabWidth };
+          hits.push({ type: 'resume', id: tab.id, col, width: Math.max(1, tabWidth - 3) });
+          hits.push({ type: 'close-tab', id: tab.id, col: col + tabWidth - 3, width: 2 });
+        } else {
+          const bg = tabHovered ? 'surface3' : 'surface2';
+          const titleStyled = s.fg(tabHovered ? 'text' : 'muted', cleanTitle);
+          const inner = ` ${dot} ${titleStyled} ${closeGlyph} `;
+          const sep = (i + 1 < visible.length && visible[i + 1].id === this.chat?.id)
+            ? ' '
+            : s.fg('border', '│');
+          tabStrip += `${paintSurface(inner, s, bg)}${sep}`;
+          hits.push({ type: 'resume', id: tab.id, col, width: Math.max(1, tabWidth - 3) });
+          hits.push({ type: 'close-tab', id: tab.id, col: col + tabWidth - 3, width: 2 });
+        }
+        col += tabWidth;
+      }
+
+      if (overflowBtn) {
+        tabStrip += ` ${overflowBtn}`;
+        hits.push({ type: 'open-chats', col: col + 1, width: visibleWidth(overflowBtn) });
+        col += 1 + visibleWidth(overflowBtn);
+      }
+    }
+
+    // Add "+" new tab button right after tabs.
+    tabStrip += ` ${newTabBtn}`;
+    hits.push({ type: 'new-chat', col: col + 1, width: newTabWidth });
+    col += 1 + newTabWidth;
+
+    // Right-align the "Chats" button on the tab strip.
+    const chatsCol = Math.max(col + 1, cols - chatsWidth - 1);
+    const padMiddle = Math.max(0, chatsCol - col);
+    if (chatsCol + chatsWidth <= cols) {
+      tabStrip += `${' '.repeat(padMiddle)}${chatsBtn}`;
+      hits.push({ type: 'open-chats', col: chatsCol, width: chatsWidth });
+    }
+
+    const row0 = paintSurface(padEndVisible(truncateVisible(tabStrip, cols), cols), s, 'surface2');
+
+    // Bottom chrome rail: continuous hairline that opens seamlessly under the active tab.
+    let rail;
+    if (activeSpan && activeSpan.start + activeSpan.width <= cols && activeSpan.width >= 3) {
+      const leftLen = activeSpan.start;
+      const openLen = Math.max(0, activeSpan.width - 2);
+      const rightLen = Math.max(0, cols - activeSpan.start - activeSpan.width);
+      rail = `${s.fg('border', '─'.repeat(leftLen))}${s.fg('accent', '╯')}${' '.repeat(openLen)}${s.fg('accent', '╰')}${s.fg('border', '─'.repeat(rightLen))}`;
+    } else {
+      rail = s.fg('border', '─'.repeat(cols));
+    }
+
+    return [row0, rail];
   }
 
   mostRestrictiveWindow() {
@@ -2861,47 +4022,143 @@ export class App {
     return `${left}${' '.repeat(Math.max(1, cols - leftWidth - rightWidth))}${right}`;
   }
 
-  renderStatus(cols) {
+  renderStatus(cols, hits = []) {
     const s = this.styler;
     let left;
     const flash = this.visibleFlash();
-    if (flash) left = s.fg(flash.color, flash.text);
-    else if (this.approval) left = s.fg('warning', 'approval needed · y allow · a always · n deny');
-    else if (this.dialog) left = s.fg('faint', '↑↓ select · enter confirm · esc close');
-    else if (this.running) left = s.fg('warning', 'working · esc interrupt · ctrl+c cancel');
-    else if (this.mode === 'plan') left = s.fg('warning', 'plan mode · enter send · /build starts');
-    else left = s.fg('faint', 'enter send · shift+enter newline · ctrl+v paste · / commands');
-    const reasoning = this.model()?.reasoningLevels?.length ? ` · think ${reasoningLabel(this.reasoning)}` : '';
-    const goal = this.goal?.status === 'active' ? ' · goal' : '';
-    let right = `${this.model()?.name || this.modelId}${reasoning}${goal}`;
-    if (this.scrollOffset > 0) right = `${GLYPHS.scrollUp} ${this.scrollOffset} · ${right}`;
-    const content = this.fitRow(` ${left}`, `${s.fg('muted', right)} `, Math.max(10, cols));
-    return s.bg('surface', padEndVisible(content, cols));
+    if (flash) {
+      const icon = flash.color === 'success' ? `${GLYPHS.checked} ` : flash.color === 'danger' ? `${GLYPHS.failed} ` : flash.color === 'warning' ? '! ' : '';
+      left = s.fg(flash.color, `${icon}${flash.text}`);
+    } else if (this.approval) {
+      left = s.fg('warning', 'approval needed · click a button or press y / a / n / esc');
+    } else if (this.dialog?.type === 'login') {
+      left = s.fg('faint', 'tab next · enter sign in · ctrl+r reveal · esc close');
+    } else if (this.dialog?.type === 'palette') {
+      left = s.fg('faint', 'tab switch section · ↑↓ select · enter run · esc close');
+    } else if (this.dialog) {
+      left = s.fg('faint', '↑↓ select · enter confirm · esc close');
+    } else if (this.compacting) {
+      left = s.fg('accent', 'compacting conversation…');
+    } else if (this.running) {
+      left = s.fg('warning', 'working · type to steer · esc interrupt · ctrl+c cancel');
+    } else if (this.mode === 'plan') {
+      left = s.fg('warning', 'plan mode · enter send · /build starts · /chats switch');
+    } else {
+      left = s.fg('faint', 'enter send · shift+enter newline · alt+←/→ tabs · /chats');
+    }
+
+    const ctx = this.contextMetrics();
+    const ctxPct = ctx.percent < 10 && ctx.percent > 0 && !Number.isInteger(ctx.percent)
+      ? `${ctx.percent.toFixed(1)}%`
+      : `${Math.round(ctx.percent)}%`;
+    const ctxVariant = ctx.percent >= 85 ? 'danger' : ctx.percent >= 65 ? 'warning' : 'subtle';
+    const ctxLabel = cols >= 102
+      ? `ctx ${ctxPct} · ${formatTokens(ctx.usedTokens)}/${formatTokens(ctx.contextWindow)}`
+      : `ctx ${ctxPct}`;
+
+    const rightSegments = [];
+    if (this.scrollOffset > 0) {
+      rightSegments.push({
+        text: button(s, `${GLYPHS.scrollUp} ${this.scrollOffset}`, {
+          variant: 'warning',
+          hovered: this.isHovered('scroll-bottom:'),
+          compact: false,
+        }),
+        hit: { type: 'scroll-bottom' },
+      });
+    }
+    rightSegments.push({
+      text: button(s, ctxLabel, {
+        variant: ctxVariant,
+        icon: '◔',
+        hovered: this.isHovered('open-context:'),
+      }),
+      hit: { type: 'open-context' },
+    });
+    if (cols >= 78) {
+      rightSegments.push({
+        text: button(s, 'Palette', {
+          variant: 'subtle',
+          icon: '⌕',
+          shortcut: cols >= 114 ? '^P' : '',
+          hovered: this.isHovered('open-palette:'),
+        }),
+        hit: { type: 'open-palette' },
+      });
+      rightSegments.push({
+        text: button(s, 'Help', {
+          variant: 'subtle',
+          icon: '?',
+          hovered: this.isHovered('open-help:'),
+        }),
+        hit: { type: 'open-help' },
+      });
+    }
+
+    const rightLayout = placeSegments(rightSegments, { startCol: 0, gap: 1 });
+    const rightCol = Math.max(0, cols - rightLayout.width - 1);
+    const leftFitted = truncateVisible(left, Math.max(0, rightCol - 2));
+    const gap = Math.max(1, rightCol - 1 - visibleWidth(leftFitted));
+    const content = ` ${leftFitted}${' '.repeat(gap)}${rightLayout.text} `;
+    if (hits) {
+      for (const h of rightLayout.hits) {
+        hits.push({ ...h, col: rightCol + h.col });
+      }
+    }
+    return paintSurface(padEndVisible(truncateVisible(content, cols), cols), s, 'surface');
+  }
+
+  renderSuggestionsOverlay(cols, maxRows, suggestionSet) {
+    const s = this.styler;
+    const kind = suggestionSet?.kind || 'command';
+    const items = (suggestionSet?.items || []).slice(0, Math.max(1, maxRows - 2));
+    const selectedIndex = items.length ? this.suggestionSelection(items).index : -1;
+    const left = Math.min(2, Math.max(0, cols - 28));
+    const width = Math.max(24, Math.min(cols - left - 2, 68));
+    const inner = Math.max(8, width - 2);
+    const label = kind === 'skill' ? 'skills' : 'commands';
+    const hint = inner >= 44 ? '↑↓ select · tab accept' : 'tab';
+    const headLeft = ` ${label} `;
+    const headRight = ` ${hint} `;
+    const fill = Math.max(0, inner - 1 - visibleWidth(headLeft) - visibleWidth(headRight));
+
+    const lines = [];
+    const hits = [];
+    lines.push(`${s.fg('accent', '╭─')}${s.bold(s.fg('accent', headLeft))}${s.fg('border', '─'.repeat(fill))}${s.fg('faint', headRight)}${s.fg('accent', '╮')}`);
+    hits.push(null);
+
+    for (let index = 0; index < items.length; index += 1) {
+      const suggestion = items[index];
+      const verb = kind === 'skill' ? '@' : '/';
+      const hitText = `${verb}${suggestion.name} `;
+      const hovered = this.isHovered(`suggestion:${hitText}`);
+      const selected = index === selectedIndex || hovered;
+      const marker = selected ? s.fg('accent', '▎') : ' ';
+      const nameCol = padEndVisible(`${verb}${suggestion.name}`, 13);
+      const name = selected ? s.bold(s.fg('accent', nameCol)) : s.fg('text', nameCol);
+      const descWidth = Math.max(6, inner - 18);
+      const description = s.fg(selected ? 'muted' : 'faint', truncate(suggestion.description || '', descWidth));
+      const rowBody = `${marker} ${name} ${description}`;
+      const painted = paintSurface(padEndVisible(truncateVisible(rowBody, inner), inner), s, selected ? 'surface3' : 'surface2');
+      lines.push(`${s.fg('accent', '│')}${painted}${s.fg('accent', '│')}`);
+      hits.push({ type: 'suggestion', text: hitText });
+    }
+
+    lines.push(`${s.fg('accent', '╰')}${s.fg('border', '─'.repeat(inner))}${s.fg('accent', '╯')}`);
+    hits.push(null);
+    return { left, width, lines, hits };
   }
 
   renderComposer(cols, hits = []) {
     const s = this.styler;
     const lines = [];
-    const suggestionSet = this.visibleSuggestions();
-    const activeSuggestions = suggestionSet?.items || [];
-    const kind = suggestionSet?.kind || null;
-    const selectedIndex = activeSuggestions.length ? this.suggestionSelection(activeSuggestions).index : -1;
-    for (let index = 0; index < activeSuggestions.length; index += 1) {
-      const suggestion = activeSuggestions[index];
-      const selected = index === selectedIndex;
-      const prefix = selected ? s.bg('surface2', s.fg('accent', ' › ')) : '   ';
-      const verb = kind === 'skill' ? '@' : '/';
-      const name = s.fg(selected ? 'accent' : 'text', `${verb}${suggestion.name.padEnd(10)}`);
-      const description = s.fg('faint', truncate(suggestion.description, Math.max(8, cols - 20)));
-      lines.push(`${prefix}${name} ${description}`);
-      hits[lines.length - 1] = { type: 'suggestion', text: `${verb}${suggestion.name} ` };
-    }
-    const title = this.approval ? 'approval required'
-      : this.running ? 'gatita is working'
-        : this.dialog ? 'dialog open'
-          : 'ask gatita';
     const inner = Math.max(8, cols - 2);
-    const textWidth = Math.max(4, inner - 2);
+
+    const borderColor = this.approval ? 'warning'
+      : this.running ? 'info'
+        : this.mode === 'plan' ? 'warning'
+          : 'border';
+    const textWidth = Math.max(4, inner - 4);
     const inputLayout = this.layoutInput(this.input, this.cursor, textWidth);
     const tokenLabels = this.composerTokenLabels(this.input);
     const maxLines = 5;
@@ -2913,14 +4170,24 @@ export class App {
     this.composerScroll = top;
     let visibleLines = inputLayout.lines.slice(top, top + maxLines);
     let cursorLine = inputLayout.cursorLine - top;
-    let scrollHint = '';
-    if (totalLines > maxLines) {
-      scrollHint = ` ${top + 1}-${top + visibleLines.length}/${totalLines}`;
+
+    // Minimal top border: only shows a quiet label during special states or scroll.
+    const stateLabel = this.approval ? 'approval required'
+      : this.running ? (this.steeringQueue.length ? `steering (${this.steeringQueue.length} queued)` : 'working')
+        : this.mode === 'plan' ? 'plan mode'
+          : '';
+    const scrollHint = totalLines > maxLines ? `${top + 1}-${top + visibleLines.length}/${totalLines}` : '';
+    const topLabel = [stateLabel, scrollHint].filter(Boolean).join(' · ');
+    if (topLabel && visibleWidth(topLabel) + 4 <= inner) {
+      const topFill = Math.max(0, inner - visibleWidth(topLabel) - 3);
+      const labelColor = borderColor === 'border' ? 'muted' : borderColor;
+      lines.push(`${s.fg(borderColor, '╭─')} ${s.bold(s.fg(labelColor, topLabel))} ${s.fg(borderColor, `${'─'.repeat(topFill)}╮`)}`);
+    } else {
+      lines.push(`${s.fg(borderColor, '╭')}${s.fg(borderColor, '─'.repeat(inner))}${s.fg(borderColor, '╮')}`);
     }
-    const titleText = truncateVisible(`${title}${scrollHint}`, Math.max(0, inner - 3));
-    const topFill = Math.max(0, inner - visibleWidth(titleText) - 3);
-    lines.push(`${s.fg('accent', '╭─')} ${s.fg('muted', titleText)} ${s.fg('border', '─'.repeat(topFill))}${s.fg('accent', '╮')}`);
+
     if (!visibleLines.length) visibleLines = [''];
+    const promptChevronColor = this.mode === 'plan' ? 'warning' : this.running ? 'info' : 'accent';
     visibleLines.forEach((line, index) => {
       let content;
       const lineStart = inputLayout.lineStarts[top + index] ?? 0;
@@ -2932,7 +4199,11 @@ export class App {
         && tokenAtCursor.start >= lineStart
         && tokenAtCursor.start < lineStart + line.length;
       if (this.input === '' && index === 0) {
-        const placeholder = this.running ? 'type to steer · enter to queue' : 'ask gatita to build something';
+        const placeholder = this.running
+          ? 'Type to steer…'
+          : this.mode === 'plan'
+            ? 'Describe what to plan…'
+            : 'Ask Gatita…';
         content = `${s.inverse(' ')} ${s.fg('faint', truncateVisible(placeholder, Math.max(0, textWidth - 2)))}`;
       } else if (tokenInLine) {
         content = styledLine;
@@ -2951,184 +4222,237 @@ export class App {
       } else {
         content = s.fg('text', styledLine);
       }
-      lines.push(`${s.fg('accent', '│')} ${padEndVisible(content, textWidth)} ${s.fg('accent', '│')}`);
+      const lead = index === 0 ? `${s.bold(s.fg(promptChevronColor, '›'))} ` : '  ';
+      const interior = paintSurface(` ${lead}${padEndVisible(content, textWidth)} `, s, 'surface');
+      lines.push(`${s.fg(borderColor, '│')}${interior}${s.fg(borderColor, '│')}`);
     });
-    lines.push(`${s.fg('accent', '╰')}${s.fg('border', '─'.repeat(inner))}${s.fg('accent', '╯')}`);
+
+    // Clean bottom border with just the essential clickable mode toggle and Send/Stop button.
+    const showBottomControls = !this.dialog && !this.approval && inner >= 30;
+    if (showBottomControls) {
+      const leftSegs = [
+        {
+          text: button(s, this.mode === 'plan' ? 'Plan' : 'Build', {
+            variant: this.mode === 'plan' ? 'warning' : 'subtle',
+            icon: this.mode === 'plan' ? '◇' : '▸',
+            active: this.mode === 'plan',
+            hovered: this.isHovered('toggle-plan:'),
+          }),
+          hit: { type: 'toggle-plan' },
+        },
+      ];
+      if (this.planDraft && inner >= 48) {
+        leftSegs.push({
+          text: button(s, 'Build Plan', {
+            variant: 'primary',
+            icon: '▸',
+            hovered: this.isHovered('use-plan:'),
+          }),
+          hit: { type: 'use-plan' },
+        });
+      }
+      if (this.todos.length && inner >= 56) {
+        const done = this.todos.filter((t) => t.status === 'completed').length;
+        leftSegs.push({
+          text: button(s, `${done}/${this.todos.length}`, {
+            variant: done === this.todos.length ? 'success' : 'subtle',
+            icon: '✓',
+            hovered: this.isHovered('open-tasks:'),
+          }),
+          hit: { type: 'open-tasks' },
+        });
+      }
+      const hasInput = Boolean(this.input.trim());
+      const actionSeg = this.running
+        ? {
+          text: button(s, 'Stop', {
+            variant: 'danger',
+            icon: '■',
+            hovered: this.isHovered('send-or-stop:'),
+          }),
+          hit: { type: 'send-or-stop' },
+        }
+        : {
+          text: button(s, 'Send', {
+            variant: hasInput ? 'primary' : 'subtle',
+            icon: '↵',
+            disabled: !hasInput,
+            hovered: hasInput && this.isHovered('send-or-stop:'),
+          }),
+          hit: { type: 'send-or-stop' },
+        };
+
+      const leftLayout = placeSegments(leftSegs, { startCol: 2, gap: 1 });
+      const actionW = visibleWidth(actionSeg.text);
+      const fillLen = inner - 2 - leftLayout.width - actionW;
+      if (fillLen >= 1) {
+        const actionCol = 2 + leftLayout.width + fillLen;
+        lines.push(`${s.fg(borderColor, '╰─')}${leftLayout.text}${s.fg(borderColor, '─'.repeat(fillLen))}${actionSeg.text}${s.fg(borderColor, '─╯')}`);
+        hits[lines.length - 1] = [
+          ...leftLayout.hits,
+          { ...actionSeg.hit, col: actionCol, width: actionW },
+        ];
+      } else {
+        lines.push(`${s.fg(borderColor, '╰')}${s.fg(borderColor, '─'.repeat(inner))}${s.fg(borderColor, '╯')}`);
+      }
+    } else {
+      lines.push(`${s.fg(borderColor, '╰')}${s.fg(borderColor, '─'.repeat(inner))}${s.fg(borderColor, '╯')}`);
+    }
     return lines;
   }
 
-  renderConversation(rows, width) {
+  renderConversation(rows, width, hits = []) {
     const s = this.styler;
     if (!this.messages.length && !this.stream.active && !this.running) {
-      return this.renderEmpty(rows, width);
+      return this.renderEmpty(rows, width, hits);
     }
-    const transcript = this.buildTranscript(Math.max(8, width - 2));
+    const transcript = this.buildTranscript(Math.max(8, width - 3));
     this.transcriptLineCount = transcript.length;
     this.conversationHeight = rows;
     const maxOffset = Math.max(0, transcript.length - rows);
     if (this.scrollOffset > maxOffset) this.scrollOffset = maxOffset;
     const start = Math.max(0, transcript.length - rows - this.scrollOffset);
     this.conversationStart = start;
+    const showScrollbar = transcript.length > rows && width >= 20;
+    const contentWidth = showScrollbar ? width - 1 : width;
     const view = transcript.slice(start, start + rows);
-    const output = view.map((line) => padEndVisible(truncateVisible(line, width), width));
-    while (output.length < rows) output.unshift(' '.repeat(width));
+    const output = view.map((line) => padEndVisible(truncateVisible(line, contentWidth), contentWidth));
+    while (output.length < rows) output.unshift(' '.repeat(contentWidth));
+
+    if (showScrollbar) {
+      const thumbSize = Math.max(1, Math.round((rows / transcript.length) * rows));
+      const scrollRatio = maxOffset > 0 ? 1 - (this.scrollOffset / maxOffset) : 1;
+      const thumbStart = Math.max(0, Math.min(rows - thumbSize, Math.round(scrollRatio * (rows - thumbSize))));
+      for (let i = 0; i < rows; i += 1) {
+        const isThumb = i >= thumbStart && i < thumbStart + thumbSize;
+        output[i] = `${output[i]}${isThumb ? s.fg(this.scrollOffset > 0 ? 'accent' : 'faint', '┃') : s.fg('border', '│')}`;
+      }
+    }
+
     if (this.scrollOffset > 0) {
-      const indicator = s.fg('warning', ` ${GLYPHS.scrollUp} ${this.scrollOffset} `);
+      const indicator = button(s, `${GLYPHS.scrollUp} ${this.scrollOffset} · latest`, {
+        variant: 'warning',
+        hovered: this.isHovered('scroll-bottom:'),
+      });
+      const indWidth = visibleWidth(indicator);
       const last = output[output.length - 1] || '';
-      output[output.length - 1] = `${sliceVisible(last, 0, Math.max(0, width - visibleWidth(indicator)))}${indicator}`;
+      const targetCol = Math.max(0, width - indWidth - (showScrollbar ? 2 : 1));
+      output[output.length - 1] = `${sliceVisible(last, 0, targetCol)}${indicator}${showScrollbar ? ' ' : ''}`;
+      if (hits) hits[output.length - 1] = { type: 'scroll-bottom', col: targetCol, width: indWidth };
     }
     return output;
   }
 
-  renderEmpty(rows, width) {
+  renderEmpty(rows, width, hits = []) {
     const s = this.styler;
-    const content = [
-      '',
-      centerVisible(s.fg('accent', GLYPHS.cat), Math.max(8, width)),
-      centerVisible(s.bold(s.fg('text', 'G A T I T A   S T U D I O')), Math.max(8, width)),
-      centerVisible(s.fg('muted', 'Your terminal. Her territory.'), Math.max(8, width)),
-      '',
-      centerVisible(s.fg('faint', `new chat in ${basenameForDisplay(this.cwd)}`), Math.max(8, width)),
-      '',
-      centerVisible(s.fg('muted', 'type a message to start'), Math.max(8, width)),
-      centerVisible(s.fg('faint', '/model · /sessions · /help'), Math.max(8, width)),
-    ];
+    const safeWidth = Math.max(8, width);
+    const content = [];
+    const contentHits = [];
+    const pushLine = (line, rowHits = null) => {
+      content.push(line);
+      contentHits.push(rowHits);
+    };
+
+    const ruleLen = Math.min(28, Math.max(8, safeWidth - 16));
+    pushLine(centerVisible(s.fg('accent', GLYPHS.cat), safeWidth));
+    pushLine(centerVisible(s.bold(s.fg('text', 'G A T I T A   S T U D I O')), safeWidth));
+    pushLine(centerVisible(`${s.fg('muted', 'Your terminal. Her territory.')}  ${s.fg('faint', `v${CLIENT_VERSION}`)}`, safeWidth));
+    pushLine(centerVisible(s.fg('border', '─'.repeat(ruleLen)), safeWidth));
+
+    const model = this.model();
+    const cardWidth = Math.min(60, safeWidth - 4);
+    if (rows >= 14 && cardWidth >= 42) {
+      pushLine('');
+      const caps = [
+        model?.tools ? s.fg('muted', 'tools') : s.fg('faint', 'chat'),
+        model?.vision ? s.fg('info', 'vision') : '',
+        model?.reasoningLevels?.length ? s.fg('accent2', `think ${reasoningLabel(this.reasoning)}`) : '',
+      ].filter(Boolean).join(s.fg('faint', ' · '));
+      const usage = this.mostRestrictiveWindow();
+      const cardLines = [
+        `${s.fg('faint', 'workspace')}  ${s.fg('text', truncateVisible(basenameForDisplay(this.cwd), Math.max(8, cardWidth - 18)))}`,
+        `${s.fg('faint', 'model    ')}  ${s.fg('accent', model?.name || this.modelId)}  ${caps}`,
+      ];
+      if (usage) {
+        const pct = Math.max(0, Math.min(100, Number(usage.percent) || 0));
+        const barW = Math.max(8, Math.min(16, cardWidth - 34));
+        const color = pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : 'accent';
+        cardLines.push(`${s.fg('faint', 'quota    ')}  ${progressBar(pct, barW, s, color)}  ${s.fg('muted', `${formatTokens(usage.remaining)} left`)}`);
+      }
+      const mcpCount = this.mcp?.status?.()?.servers?.length || 0;
+      const skillCount = (this.skills || []).length;
+      const extParts = [
+        `${skillCount} ${skillCount === 1 ? 'skill' : 'skills'}`,
+        `${mcpCount} mcp`,
+        this.mode === 'plan' ? s.fg('warning', 'plan mode') : 'build mode',
+      ].join(' · ');
+      cardLines.push(`${s.fg('faint', 'ready    ')}  ${s.fg('muted', extParts)}`);
+
+      const box = roundedBox({
+        width: cardWidth,
+        styler: s,
+        title: 'session',
+        subtitle: (this.plan?.displayName || 'Free').replace(/^Gatita\s+/i, '').toLowerCase(),
+        borderColor: 'border',
+        titleColor: 'muted',
+        lines: cardLines,
+      });
+      const padLeftCol = Math.max(0, Math.floor((safeWidth - cardWidth) / 2));
+      const padLeft = ' '.repeat(padLeftCol);
+      box.forEach((boxLine, boxIdx) => {
+        let rowHit = null;
+        if (boxIdx === 1) rowHit = [{ type: 'open-workspace', col: padLeftCol, width: cardWidth }];
+        else if (boxIdx === 2) rowHit = [{ type: 'open-models', col: padLeftCol, width: cardWidth }];
+        else if (boxIdx === 3 && usage) rowHit = [{ type: 'open-usage', col: padLeftCol, width: cardWidth }];
+        pushLine(`${padLeft}${boxLine}`, rowHit);
+      });
+    } else {
+      pushLine('');
+      pushLine(centerVisible(s.fg('faint', `new chat in ${basenameForDisplay(this.cwd)}`), safeWidth));
+    }
+
+    if (rows >= 12 && safeWidth >= 50) {
+      pushLine('');
+      const chips = [
+        { icon: GLYPHS.spark, label: 'explain codebase', text: 'Explain the architecture and key files of this project.' },
+        { icon: '▸', label: 'run tests', text: 'Run the test suite and report any issues.' },
+        { icon: '◆', label: 'switch model', command: '/model' },
+      ];
+      if ((this.recentChats || []).length > 0 && safeWidth >= 78) {
+        chips.push({ icon: '▤', label: 'browse chats', command: '/chats' });
+      }
+      const segments = chips.map((chip) => {
+        const hit = { type: 'starter-prompt', text: chip.text, command: chip.command };
+        return {
+          text: button(s, chip.label, {
+            variant: 'secondary',
+            icon: chip.icon,
+            hovered: this.isHovered(this.hoverKeyFor(hit)),
+          }),
+          hit,
+        };
+      });
+      const laid = placeSegments(segments, { startCol: 0, gap: 2 });
+      if (laid.width <= safeWidth - 2) {
+        const startCol = Math.max(0, Math.floor((safeWidth - laid.width) / 2));
+        const placed = placeSegments(segments, { startCol, gap: 2 });
+        pushLine(`${' '.repeat(startCol)}${placed.text}`, placed.hits);
+      }
+    }
+
+    pushLine('');
+    pushLine(centerVisible(s.fg('faint', '/chats · /model · /plan · /login · ctrl+p palette · /help'), safeWidth));
+
     const top = Math.max(0, Math.floor((rows - content.length) / 2));
     const output = [];
     for (let index = 0; index < rows; index += 1) {
       const contentIndex = index - top;
-      output.push(contentIndex >= 0 && contentIndex < content.length ? padEndVisible(content[contentIndex], width) : ' '.repeat(width));
-    }
-    return output;
-  }
-
-  renderSidebar(rows, width, hits = []) {
-    const s = this.styler;
-    const lines = [];
-    const label = (text) => s.fg('faint', text.toUpperCase());
-    const push = (line, hitList = null) => {
-      lines.push(line);
-      hits[lines.length - 1] = hitList ? (Array.isArray(hitList) ? hitList : [hitList]) : null;
-    };
-    const remainingRoom = () => Math.max(0, rows - lines.length);
-
-    const cardWidth = Math.max(11, Math.floor((Math.max(20, width) - 2) / 2));
-    const card = ({ glyph, label: text, type, active = false }, startCol) => {
-      const border = active ? 'accent' : 'border';
-      const shadowBg = 'surface2';
-      const innerWidth = cardWidth - 2;
-      const plain = `▎ ${glyph} ${text}`;
-      const content = padEndVisible(truncateVisible(plain, innerWidth), innerWidth);
-      const face = `${s.fg(border, '│')}${s.bg(shadowBg, s.fg(active ? 'accent' : 'text', content))}${s.fg(border, '│')}`;
-      const top = `${s.fg(border, `╭${'─'.repeat(cardWidth - 2)}╮`)}`;
-      const bottom = `${s.fg(border, `╰${'─'.repeat(cardWidth - 2)}╯`)}`;
-      return [
-        { line: top, hit: [{ type, col: startCol, width: cardWidth }] },
-        { line: face, hit: [{ type, col: startCol, width: cardWidth }] },
-        { line: bottom, hit: [{ type, col: startCol, width: cardWidth }] },
-      ];
-    };
-    const wideCard = ({ glyph, label: text, type, active = true }) => {
-      const innerWidth = Math.max(4, width - 2);
-      const plain = `▎ ${glyph} ${text}`;
-      const content = padEndVisible(truncateVisible(plain, innerWidth), innerWidth);
-      const face = `${s.bg('surface2', s.fg('accent', content))}`;
-      const border = 'accent';
-      return [
-        { line: s.fg(border, `╭${'─'.repeat(innerWidth)}╮`), hit: [{ type, col: 0, width }] },
-        { line: `${s.fg(border, '│')}${face}${s.fg(border, '│')}`, hit: [{ type, col: 0, width }] },
-        { line: s.fg(border, `╰${'─'.repeat(innerWidth)}╯`), hit: [{ type, col: 0, width }] },
-      ];
-    };
-    const buttons = [
-      { glyph: '+', label: 'new chat', type: 'new-chat' },
-      { glyph: '▤', label: 'folders', type: 'open-folders' },
-      { glyph: '◔', label: 'usage', type: 'open-usage', active: (this.mostRestrictiveWindow()?.percent || 0) >= 80 },
-      { glyph: '⚙', label: 'settings', type: 'open-settings' },
-    ];
-    for (let index = 0; index < buttons.length; index += 2) {
-      const left = card(buttons[index], 1);
-      const right = card(buttons[index + 1], 2 + cardWidth);
-      for (let offset = 0; offset < 3; offset += 1) {
-        push(`${left[offset].line} ${right[offset].line}`, [...left[offset].hit, ...right[offset].hit]);
+      if (contentIndex >= 0 && contentIndex < content.length) {
+        output.push(padEndVisible(truncateVisible(content[contentIndex], safeWidth), safeWidth));
+        if (hits && contentHits[contentIndex]) hits[index] = contentHits[contentIndex];
+      } else {
+        output.push(' '.repeat(safeWidth));
       }
-      if (index + 2 < buttons.length) push('');
-    }
-    const planBlock = this.planDraft
-      ? wideCard({ glyph: '▸', label: `use plan · ${this.planQuestionsAsked || 0} q`, type: 'use-plan' })
-      : null;
-    if (planBlock) {
-      push('');
-      for (const row of planBlock) push(row.line, row.hit);
-    }
-
-    push('');
-    push(` ${label('folders')}`);
-    const activeFolder = this.folders.find((folder) => folder.id === this.config.lastFolderId);
-    push(`  ${s.fg(activeFolder ? 'accent' : 'muted', '▸')} ${s.fg(activeFolder ? 'text' : 'muted', truncate(activeFolder?.name || 'all chats', width - 5))}`, { type: 'folder', id: activeFolder?.id ?? null });
-    for (const folder of this.folders.slice(0, 2)) {
-      if (folder.id === activeFolder?.id) continue;
-      push(`    ${s.fg('muted', truncate(folder.name, Math.max(4, width - 8)))} ${s.fg('faint', String(folder.chatCount))}`, { type: 'folder', id: folder.id });
-    }
-    {
-      const plusContent = padEndVisible(truncateVisible('▎ + new folder', Math.max(4, width - 4)), Math.max(4, width - 4));
-      push(`  ${s.bg('surface2', s.fg('accent', plusContent))}`, [{ type: 'new-folder', col: 0, width }]);
-    }
-
-    push('');
-    push(` ${label('usage')}`);
-    const normalizePercent = (value) => {
-      const number = Number(value);
-      if (!Number.isFinite(number)) return 0;
-      return Math.max(0, Math.min(100, number));
-    };
-    const formatPercent = (percent) => (percent < 10 && !Number.isInteger(percent)
-      ? `${percent.toFixed(1)}%`
-      : `${Math.round(percent)}%`);
-    const windows = this.quota?.windows || [];
-    if (windows.length) {
-      for (const window of windows) {
-        const percent = normalizePercent(window.percent);
-        const color = percent >= 95 ? 'danger' : percent >= 80 ? 'warning' : 'accent';
-        const barWidth = Math.max(4, width - 15);
-        push(`  ${s.fg('muted', String(window.shortLabel || '').padEnd(4))} ${progressBar(percent, barWidth, s, color)} ${s.fg('faint', formatPercent(percent))}`);
-        const reset = window.resetAt ? `resets in ${formatDuration(Math.max(0, window.resetAt - Date.now()), { compact: true })}` : 'no reset scheduled';
-        push(`    ${s.fg('faint', truncate(`${formatTokens(window.used)} / ${formatTokens(window.limit)} · ${reset}`, Math.max(4, width - 6)))}`);
-      }
-    } else {
-      push(`  ${s.fg('faint', 'no quota data')}`);
-    }
-
-    if (remainingRoom() >= 3) {
-      push('');
-      push(` ${label('recent')}`);
-      const chats = this.recentChats.slice(0, Math.max(1, Math.min(8, remainingRoom() - 2)));
-      if (!chats.length) push(`  ${s.fg('faint', 'no chats yet')}`);
-      for (const chat of chats) {
-        const active = this.chat?.id === chat.id;
-        const marker = active ? s.fg('accent', '›') : ' ';
-        push(`${marker} ${s.fg(active ? 'text' : 'muted', truncate(chat.title, width - 4))}`, { type: 'resume', id: chat.id });
-      }
-    }
-    if (remainingRoom() >= 4 && this.todos.length) {
-      push('');
-      push(` ${label('tasks')}`);
-      for (const todo of this.todos.slice(0, Math.max(1, Math.min(5, remainingRoom() - 2)))) {
-        const glyph = todo.status === 'completed' ? s.fg('success', '✓')
-          : todo.status === 'in_progress' ? s.fg('accent', '◐')
-            : s.fg('faint', '○');
-        push(`  ${glyph} ${s.fg(todo.status === 'completed' ? 'faint' : 'muted', truncate(todo.content, width - 5))}`);
-      }
-    }
-    if (remainingRoom() >= 4) {
-      push('');
-      push(` ${label('workspace')}`);
-      push(`  ${s.fg('muted', truncate(basenameForDisplay(this.cwd), width - 4))}`);
-      push(`  ${s.fg('faint', truncate(this.cwd, width - 4))}`);
-    }
-    const output = [];
-    for (let index = 0; index < rows; index += 1) {
-      output.push(padEndVisible(truncateVisible(lines[index] || '', width), width));
     }
     return output;
   }
@@ -3143,6 +4467,12 @@ export class App {
     const turns = [];
     let current = null;
     for (const message of messages) {
+      if (isCompactionCheckpoint(message)) {
+        if (current) turns.push(current);
+        current = null;
+        turns.push({ compaction: message, user: null, messages: [message], final: null, workMessages: [], tools: 0, errorCount: 0 });
+        continue;
+      }
       if (message.role === 'user') {
         if (current) turns.push(current);
         current = { user: message, messages: [message], final: null, workMessages: [], tools: 0, errorCount: 0 };
@@ -3178,7 +4508,7 @@ export class App {
       turn.errorCount = turn.messages.filter((message) => message.role === 'tool' && message.meta?.isError).length;
       turn.workMessages = turn.messages.filter((message) => message.role === 'tool'
         || (message.role === 'assistant' && message !== final));
-      turn.active = Boolean(this.running) && index === turns.length - 1;
+      turn.active = Boolean(this.running && !this.compacting) && !turn.compaction && index === turns.length - 1;
     }
     return turns;
   }
@@ -3285,11 +4615,12 @@ export class App {
         return lines;
       }
       const clock = message.createdAt ? s.fg('faint', formatClock(message.createdAt)) : '';
-      lines.push(`${s.fg('accent2', '▌')} ${s.bold(s.fg('accent2', 'you'))} ${clock}`);
-      const innerWidth = Math.max(4, width - 4);
+      lines.push(`${s.fg('accent2', GLYPHS.thickBar)} ${s.bold(s.fg('accent2', 'you'))} ${clock}`);
+      const innerWidth = Math.max(4, width - 5);
       const content = renderMarkdown(message.content || '', innerWidth, s, { base: 'text' });
       for (const line of content) {
-        lines.push(`  ${s.bg('surface2', ` ${padEndVisible(line, innerWidth)} `)}`);
+        const body = ` ${padEndVisible(truncateVisible(line, innerWidth), innerWidth)} `;
+        lines.push(`${s.fg('accent2', GLYPHS.thickBar)} ${paintSurface(body, s, 'surface2')}`);
       }
       if (Array.isArray(message.meta?.images) && message.meta.images.length) {
         const boxes = message.meta.images.map((_image, index) => s.bg('imageBg', s.bold(s.fg('image', `[Image ${index + 1}]`)))).join(' ');
@@ -3300,15 +4631,16 @@ export class App {
     if (message.role === 'assistant') {
       const modelName = message.meta?.model || this.modelId;
       const clock = message.createdAt ? s.fg('faint', formatClock(message.createdAt)) : '';
-      lines.push(`${s.fg('accent', GLYPHS.cat)} ${s.bold(s.fg('accent', 'gatita'))} ${s.fg('faint', modelName)} ${clock}`);
+      const modelChip = s.pill('muted', 'surface2', modelName);
+      lines.push(`${s.fg('accent', GLYPHS.cat)} ${s.bold(s.fg('accent', 'gatita'))} ${modelChip} ${clock}`);
       if (message.reasoning) {
         const expanded = this.expandedReasoning.has(message.id);
         if (expanded) {
-          const reasoning = renderMarkdown(message.reasoning, Math.max(8, width - 4), s, { base: 'faint', indent: '' });
+          const reasoning = renderMarkdown(message.reasoning, Math.max(8, width - 5), s, { base: 'faint', indent: '' });
           const shown = reasoning.slice(0, 12);
-          for (const line of shown) lines.push(`  ${s.fg('faint', '│ ')}${s.fg('faint', truncateToWidth(line, width - 5))}`);
-          if (reasoning.length > shown.length) lines.push(`  ${s.fg('faint', `│ … ${reasoning.length - shown.length} more lines · m to minimize`)}`);
-          else lines.push(`  ${s.fg('faint', '│ m to minimize')}`);
+          for (const line of shown) lines.push(`  ${s.fg('border', '│ ')}${s.fg('faint', truncateToWidth(line, width - 5))}`);
+          if (reasoning.length > shown.length) lines.push(`  ${s.fg('border', '╰ ')}${s.fg('faint', `… ${reasoning.length - shown.length} more lines · m to minimize`)}`);
+          else lines.push(`  ${s.fg('border', '╰ ')}${s.fg('faint', 'm to minimize')}`);
         } else {
           const approx = Math.max(1, Math.round((message.reasoning.length || 0) / 4));
           lines.push(`  ${s.fg('faint', `▸ thought for ${formatTokens(approx)} tokens · m to expand · /thinking`)}`);
@@ -3356,25 +4688,28 @@ export class App {
     else if (result.meta?.isError) statusGlyph = s.fg('danger', GLYPHS.failed);
     else statusGlyph = s.fg('success', GLYPHS.checked);
     const duration = result?.meta?.durationMs ? s.fg('faint', ` ${formatDuration(result.meta.durationMs, { compact: true })}`) : '';
-    const icon = s.fg(result?.meta?.isError ? 'danger' : 'muted', toolIcon(name));
-    const line = `  ${icon} ${s.fg('text', name)}${summary ? ` ${s.fg('muted', truncate(summary, Math.max(8, width - name.length - 12)))}` : ''} ${statusGlyph}${duration}`;
+    const icon = s.fg(result?.meta?.isError ? 'danger' : running ? 'accent' : 'muted', toolIcon(name));
+    const rail = s.fg(result?.meta?.isError ? 'danger' : running ? 'accent' : 'border', '╭');
+    const line = `  ${rail} ${icon} ${s.bold(s.fg('text', name))}${summary ? ` ${s.fg('muted', truncate(summary, Math.max(8, width - name.length - 16)))}` : ''} ${statusGlyph}${duration}`;
     const lines = [line];
     if (result) {
       const raw = String(result.content || '').split('\n').filter((entry, index, array) => entry !== '' || array[index - 1] !== '');
       const expanded = this.expandedTools.has(result.toolCallId || result.id);
+      const lineRail = s.fg(result.meta?.isError ? 'danger' : 'border', '│');
+      const endRail = s.fg(result.meta?.isError ? 'danger' : 'border', '╰');
       if (expanded) {
         const shown = raw.slice(0, 24);
         for (const entry of shown) {
-          lines.push(`    ${s.fg(result.meta?.isError ? 'danger' : 'faint', truncateToWidth(entry, Math.max(8, width - 6)))}`);
+          lines.push(`  ${lineRail} ${s.fg(result.meta?.isError ? 'danger' : 'faint', truncateToWidth(entry, Math.max(8, width - 6)))}`);
         }
-        if (raw.length > shown.length) lines.push(`    ${s.fg('faint', `… ${raw.length - shown.length} more lines · ctrl+o to collapse`)}`);
-        else lines.push(`    ${s.fg('faint', 'ctrl+o to collapse')}`);
+        if (raw.length > shown.length) lines.push(`  ${endRail} ${s.fg('faint', `… ${raw.length - shown.length} more lines · ctrl+o to collapse`)}`);
+        else lines.push(`  ${endRail} ${s.fg('faint', 'ctrl+o to collapse')}`);
       } else {
         const first = raw[0] || '';
-        lines.push(`    ${s.fg(result.meta?.isError ? 'danger' : 'faint', truncateToWidth(first, Math.max(8, width - 6)))}`);
         const hidden = Math.max(0, raw.length - 1);
+        lines.push(`  ${hidden ? lineRail : endRail} ${s.fg(result.meta?.isError ? 'danger' : 'faint', truncateToWidth(first, Math.max(8, width - 6)))}`);
         if (hidden) {
-          lines.push(`    ${s.fg('faint', `… ${hidden} more line${hidden === 1 ? '' : 's'} · ctrl+o to expand`)}`);
+          lines.push(`  ${endRail} ${s.fg('faint', `… ${hidden} more line${hidden === 1 ? '' : 's'} · ctrl+o to expand`)}`);
         }
       }
     }
@@ -3418,6 +4753,17 @@ export class App {
     };
     const turns = this.groupTurns(this.messages);
     for (const turn of turns) {
+      if (turn.compaction) {
+        const s = this.styler;
+        const count = Number(turn.compaction.meta?.compactedCount || 0);
+        const tag = count > 0
+          ? ` ✦ compacted · ${count} earlier ${count === 1 ? 'message' : 'messages'} summarized `
+          : ' ✦ conversation compacted ';
+        const ruleW = Math.max(4, Math.floor((Math.max(12, width - visibleWidth(tag))) / 2));
+        const divider = `${s.fg('border', '─'.repeat(ruleW))}${s.fg('accent', tag)}${s.fg('border', '─'.repeat(ruleW))}`;
+        pushBlock([centerVisible(truncateVisible(divider, width), width)]);
+        continue;
+      }
       if (turn.active) {
         const userBlock = turn.user ? this.messageBlock(turn.user, width, toolResults) : [];
         const activeBlock = [...userBlock, ...this.renderActiveTurn(turn, width, toolResults)];
@@ -3471,78 +4817,288 @@ export class App {
     return lines;
   }
 
-  renderApproval(rows, cols) {
+  renderApproval(rows, cols, recordHit) {
     const s = this.styler;
     const request = this.approval;
-    const width = Math.min(cols - 4, 78);
+    const width = Math.min(cols - 4, 80);
+    const highRisk = request.group === 'computer' || request.group === 'shell';
+    const medRisk = request.group === 'write' || request.group === 'edit' || request.group === 'mcp';
+    const riskPill = highRisk
+      ? badge(s, 'HIGH RISK', { fg: 'danger', bg: 'dangerBg', bold: true })
+      : medRisk
+        ? badge(s, 'MODIFY', { fg: 'warning', bg: 'warningBg', bold: true })
+        : badge(s, 'ACTION', { fg: 'info', bg: 'infoBg', bold: true });
     const body = [];
-    body.push(`${s.fg('warning', 'Gatita wants to run a tool.')}`);
+    body.push(`${riskPill}  ${s.fg('text', 'Gatita wants to run a tool.')}`);
     body.push('');
-    body.push(`  ${s.fg('accent', toolIcon(request.tool))} ${s.bold(s.fg('text', request.tool))}  ${s.fg('muted', truncate(request.summary || '', width - 20))}`);
+    body.push(`  ${s.fg('accent', toolIcon(request.tool))} ${s.bold(s.fg('text', request.tool))}  ${s.fg('muted', truncate(request.summary || '', Math.max(10, width - 22)))}`);
     body.push(`  ${s.fg('faint', `group: ${request.group}`)}`);
     body.push('');
     if (request.args && Object.keys(request.args).length) {
-      const pretty = JSON.stringify(request.args, null, 2).split('\n').slice(0, 10);
-      for (const line of pretty) body.push(`  ${s.fg('muted', truncateVisible(line, width - 6))}`);
-      const total = JSON.stringify(request.args, null, 2).split('\n').length;
-      if (total > 10) body.push(`  ${s.fg('faint', `… ${total - 10} more lines`)}`);
+      const allLines = JSON.stringify(request.args, null, 2).split('\n');
+      const pretty = allLines.slice(0, 10);
+      for (const line of pretty) body.push(`  ${paintSurface(` ${padEndVisible(truncateVisible(s.fg('muted', line), Math.max(8, width - 10)), Math.max(8, width - 10))} `, s, 'surface2')}`);
+      if (allLines.length > 10) body.push(`  ${s.fg('faint', `… ${allLines.length - 10} more lines`)}`);
       body.push('');
     }
     if (request.group === 'computer') {
-      body.push(`${s.fg('danger', 'This controls your real mouse and keyboard.')}`);
+      body.push(paintSurface(` ${s.bold(s.fg('danger', '! This controls your real mouse and keyboard.'))} `, s, 'dangerBg'));
       body.push('');
     }
-    body.push(`${s.fg('success', '[y]')} allow once   ${s.fg('warning', '[a]')} always allow ${request.group}   ${s.fg('danger', '[n]')} deny`);
-    body.push(`${s.fg('faint', 'esc denies and stops the turn')}`);
+    const actionLayout = placeSegments([
+      {
+        text: button(s, 'Allow once', {
+          variant: 'success',
+          icon: '✓',
+          shortcut: 'y',
+          hovered: this.isHovered('approval-allow:'),
+        }),
+        hit: { type: 'approval-allow' },
+      },
+      {
+        text: button(s, `Always ${request.group}`, {
+          variant: 'warning',
+          icon: '✦',
+          shortcut: 'a',
+          hovered: this.isHovered('approval-always:'),
+        }),
+        hit: { type: 'approval-always' },
+      },
+      {
+        text: button(s, 'Deny', {
+          variant: 'danger',
+          icon: '✗',
+          shortcut: 'n',
+          hovered: this.isHovered('approval-deny:'),
+        }),
+        hit: { type: 'approval-deny' },
+      },
+    ], { startCol: 0, gap: 2 });
+    const btnLineIndex = body.length;
+    body.push(actionLayout.text);
+
     return renderDialogBand({
       columns: cols,
       rows,
       title: 'approval',
+      subtitle: request.group,
       body,
-      footer: '',
+      footer: 'click a button or press y allow · a always · n deny · esc stop',
+      borderColor: highRisk ? 'danger' : 'warning',
       styler: s,
+      closable: true,
+      closeHovered: this.isHovered('close-dialog:'),
+      recordCloseHit: recordHit ? (rowIndex, closeCol, closeWidth) => {
+        recordHit(rowIndex, { type: 'close-dialog', col: closeCol, width: closeWidth });
+      } : undefined,
+      recordHit: recordHit ? (rowIndex, bodyLine, contentCol) => {
+        if (bodyLine !== btnLineIndex) return;
+        recordHit(rowIndex, actionLayout.hits.map((h) => ({ ...h, col: contentCol + h.col })));
+      } : undefined,
     });
   }
 
   renderDialog(rows, cols, recordHit) {
     const s = this.styler;
     const dialog = this.dialog;
-    if (!dialog) return this.renderApproval(rows, cols);
-    const band = ({ body, title, hits }) => {
+    if (!dialog) return this.renderApproval(rows, cols, recordHit);
+    if (dialog.type === 'login' && dialog.view) {
+      return dialog.view.render(cols, rows);
+    }
+    const maxDialogWidth = dialog.type === 'palette' ? 74 : 84;
+    const dialogInnerWidth = Math.max(20, Math.min(cols - 4, maxDialogWidth) - 4);
+    const band = ({ body, title, subtitle = '', footer = '', hits, borderColor = 'accent', maxWidth = maxDialogWidth }) => {
       this.dialogHits = hits || new Map();
       return renderDialogBand({
         columns: cols,
         rows,
         title,
+        subtitle,
         body,
-        footer: '',
+        footer,
+        borderColor,
+        maxWidth,
         styler: s,
-        recordHit: hits ? (rowsIndex, bodyLine) => {
+        closable: true,
+        closeHovered: this.isHovered('close-dialog:'),
+        recordCloseHit: recordHit ? (rowIndex, closeCol, closeWidth) => {
+          recordHit(rowIndex, { type: 'close-dialog', col: closeCol, width: closeWidth });
+        } : undefined,
+        recordHit: hits ? (rowsIndex, bodyLine, contentCol, contentWidth) => {
           const hit = this.dialogHits.get(bodyLine);
-          if (hit) recordHit?.(rowsIndex, hit);
+          if (!hit) return;
+          const entries = Array.isArray(hit) ? hit : [hit];
+          const shifted = entries.map((entry) => (
+            entry.col != null
+              ? { ...entry, col: contentCol + entry.col }
+              : { ...entry, col: contentCol, width: contentWidth }
+          ));
+          recordHit?.(rowsIndex, shifted.length === 1 ? shifted[0] : shifted);
         } : undefined,
       });
     };
+    const highlightRow = (content, selected) => {
+      const fitted = padEndVisible(truncateVisible(content, dialogInnerWidth), dialogInnerWidth);
+      return selected ? paintSurface(fitted, s, 'surface2') : content;
+    };
+
+    if (dialog.type === 'palette') {
+      const activeTab = dialog.tab || 'quick';
+      const filtering = Boolean(String(dialog.filter || '').trim());
+      const items = this.dialogItems(dialog);
+      const body = [];
+      const hits = new Map();
+
+      // Search input field (clean elevated surface box).
+      const searchInner = dialog.filter
+        ? `${s.fg('accent', '⌕')}  ${s.fg('text', dialog.filter)}${s.inverse(' ')}`
+        : `${s.fg('accent', '⌕')}  ${s.fg('faint', 'Search commands, models, themes, chats…')}`;
+      body.push(paintSurface(` ${padEndVisible(truncateVisible(searchInner, dialogInnerWidth - 2), dialogInnerWidth - 2)} `, s, 'surface2'));
+
+      // Category filter tabs (clickable & switchable via Tab / ← →).
+      const tabSegments = this.paletteTabs().map((tab) => {
+        const isCurrent = !filtering && activeTab === tab.id;
+        return {
+          text: button(s, tab.label, {
+            variant: isCurrent ? 'primary' : 'subtle',
+            hovered: this.isHovered(`palette-tab:${tab.id}`),
+            active: isCurrent,
+          }),
+          hit: { type: 'palette-tab', tab: tab.id },
+        };
+      });
+      const tabLayout = placeSegments(tabSegments, { startCol: 0, gap: 1 });
+      body.push(tabLayout.text);
+      hits.set(body.length - 1, tabLayout.hits);
+      body.push(s.fg('border', '─'.repeat(dialogInnerWidth)));
+
+      const maxBody = Math.max(4, rows - 4);
+      const headerReserve = (!filtering && activeTab === 'quick') ? 5 : 3;
+      const maxVisible = Math.max(1, Math.min(9, maxBody - headerReserve));
+      const selectedIdx = Math.max(0, Math.min(items.length - 1, dialog.index || 0));
+      const windowStart = Math.max(0, Math.min(items.length - maxVisible, selectedIdx - Math.floor(maxVisible / 2)));
+      const visible = items.slice(Math.max(0, windowStart), Math.max(0, windowStart) + maxVisible);
+
+      if (!visible.length) {
+        body.push(s.fg('faint', '  No matching items. Try another keyword or switch tabs.'));
+      } else {
+        let lastSection = '';
+        for (let offset = 0; offset < visible.length; offset += 1) {
+          const item = visible[offset];
+          const idx = Math.max(0, windowStart) + offset;
+          const selected = idx === selectedIdx;
+          const needsSection = !filtering && activeTab === 'quick' && item.section && item.section !== lastSection;
+          const extraLines = needsSection ? (lastSection ? 2 : 1) : 0;
+          if (body.length + extraLines + 1 > maxBody) break;
+          if (needsSection) {
+            if (lastSection) body.push('');
+            body.push(s.bold(s.fg('faint', `  ${item.section}`)));
+            lastSection = item.section;
+          }
+          const marker = selected ? s.fg('accent', '▎') : ' ';
+          const icon = item.kind === 'command' ? s.fg('accent', '›')
+            : item.kind === 'action' ? s.fg('accent', '✦')
+              : item.kind === 'model' ? s.fg('info', '◆')
+                : item.kind === 'theme' ? s.fg('accent2', '●')
+                  : s.fg('muted', '▤');
+          const rawLabel = filtering ? item.label : (item.displayLabel || item.label);
+          const hintText = filtering
+            ? (item.kind === 'command' ? 'cmd' : item.kind === 'session' ? 'chat' : item.kind)
+            : (item.hint || '');
+          const rightBadge = hintText ? s.fg(item.active ? 'success' : 'faint', hintText) : '';
+          const rightW = visibleWidth(rightBadge);
+          const labelW = Math.min(24, Math.max(14, Math.floor(dialogInnerWidth * 0.36)));
+          const labelCol = padEndVisible(truncateVisible(rawLabel, labelW), labelW);
+          const styledLabel = selected ? s.bold(s.fg('accent', labelCol)) : s.fg('text', labelCol);
+          const detailRoom = Math.max(6, dialogInnerWidth - labelW - rightW - 8);
+          const detailStr = truncate(item.detail || '', detailRoom);
+          const leftRow = `${marker} ${icon} ${styledLabel} ${s.fg(selected ? 'muted' : 'faint', detailStr)}`;
+          const rowGap = Math.max(1, dialogInnerWidth - visibleWidth(leftRow) - rightW - 1);
+          const fullRow = rightBadge ? `${leftRow}${' '.repeat(rowGap)}${rightBadge} ` : leftRow;
+          body.push(highlightRow(fullRow, selected));
+          hits.set(body.length - 1, { type: 'palette-item', item });
+        }
+      }
+
+      const subtitle = filtering
+        ? `${items.length} ${items.length === 1 ? 'match' : 'matches'}`
+        : `${activeTab} · ${items.length}`;
+      return band({
+        title: 'command palette',
+        subtitle,
+        body,
+        footer: 'tab section · ↑↓ select · enter run · type to search · esc close',
+        hits,
+      });
+    }
     if (dialog.type === 'plan') {
       const plan = this.planDraft || String(dialog.plan || '').trim();
       const body = [];
+      const hits = new Map();
       body.push(s.fg('faint', `${this.planQuestionsAsked || 0} clarifying question${(this.planQuestionsAsked || 0) === 1 ? '' : 's'} asked while planning`));
       body.push('');
       const planLines = plan ? plan.split(/\r?\n/) : ['(the plan is missing)'];
-      const maxLines = Math.max(8, rows - 6);
+      const maxLines = Math.max(6, rows - 11);
       const start = Math.max(0, Math.min(dialog.scroll || 0, Math.max(0, planLines.length - maxLines)));
       for (const line of planLines.slice(start, start + maxLines)) {
-        body.push(truncateToWidth(line, Math.max(8, Math.min(cols, 96) - 6)));
+        body.push(truncateToWidth(line, Math.max(8, dialogInnerWidth)));
       }
       body.push('');
-      body.push(`${s.fg('accent', 'enter build')} · ${s.fg('faint', 'esc keep planning')}`);
-      return band({ title: 'build this plan', body });
+      const planActions = placeSegments([
+        {
+          text: button(s, 'Build plan', {
+            variant: 'primary',
+            icon: '▸',
+            shortcut: '↵',
+            hovered: this.isHovered('plan-build:'),
+          }),
+          hit: { type: 'plan-build' },
+        },
+        {
+          text: button(s, 'Keep planning', {
+            variant: 'secondary',
+            shortcut: 'esc',
+            hovered: this.isHovered('plan-keep:'),
+          }),
+          hit: { type: 'plan-keep' },
+        },
+      ], { startCol: 0, gap: 2 });
+      body.push(planActions.text);
+      hits.set(body.length - 1, planActions.hits);
+      return band({
+        title: 'build this plan',
+        subtitle: planLines.length > maxLines ? `${start + 1}-${Math.min(planLines.length, start + maxLines)}/${planLines.length}` : '',
+        body,
+        footer: 'enter build · ↑↓ scroll · esc keep planning',
+        hits,
+      });
     }
     if (dialog.type === 'confirm') {
-      const hits = new Map([[2, { type: 'confirm' }]]);
+      const actions = placeSegments([
+        {
+          text: button(s, 'Yes', {
+            variant: 'success',
+            icon: '✓',
+            shortcut: 'y',
+            hovered: this.isHovered('confirm-yes:'),
+          }),
+          hit: { type: 'confirm-yes' },
+        },
+        {
+          text: button(s, 'No', {
+            variant: 'danger',
+            icon: '✗',
+            shortcut: 'n',
+            hovered: this.isHovered('confirm-no:'),
+          }),
+          hit: { type: 'confirm-no' },
+        },
+      ], { startCol: 0, gap: 2 });
+      const hits = new Map([[2, actions.hits]]);
       return band({
         title: 'confirm',
-        body: [dialog.message, '', `${s.fg('success', '[y]')} yes   ${s.fg('danger', '[n]')} no`],
+        body: [dialog.message, '', actions.text],
+        footer: 'click a button or press y confirm · n / esc cancel',
         hits,
       });
     }
@@ -3553,12 +5109,14 @@ export class App {
       if (dialog.expired) {
         return band({
           title: 'gatita is asking…',
+          borderColor: 'warning',
           body: [
             s.fg('warning', 'This question timed out after 5 minutes.'),
             '',
             s.fg('muted', 'Gatita is cancelling the task and cleaning up.'),
             s.fg('faint', 'Press enter or esc to close this box.'),
           ],
+          footer: 'enter / esc close',
         });
       }
       const current = entry.questions[dialog.index] || entry.questions[0];
@@ -3570,22 +5128,23 @@ export class App {
       body.push(s.fg('muted', `question ${dialog.index + 1} of ${entry.questions.length} · ${mm}:${ss} left`));
       body.push('');
       body.push(s.bold(s.fg('accent', current.question)));
-      if (current.multiSelect) body.push(s.fg('faint', 'choose any number — enter toggles a check, tab moves on'));
+      if (current.multiSelect) body.push(s.fg('faint', 'choose any number: enter toggles a check, tab moves on'));
       body.push('');
       for (let index = 0; index < current.options.length; index += 1) {
         const option = current.options[index];
         const selected = index === (dialog.cursor || 0);
         const checked = current.multiSelect && dialog.selected.has(`${current.id}:${option.id}`);
-        const statusGlyph = current.multiSelect ? (checked ? '✓' : '○') : '○';
-        const marker = selected ? s.fg('accent', '›') : ' ';
-        body.push(`${marker} ${s.fg(selected ? 'text' : 'muted', statusGlyph)} ${s.fg(selected ? 'accent' : 'text', option.label)}`);
+        const statusGlyph = current.multiSelect ? (checked ? '✓' : '○') : (selected ? '●' : '○');
+        const marker = selected ? s.fg('accent', '▎') : ' ';
+        const rowLine = `${marker} ${s.fg(checked ? 'success' : selected ? 'accent' : 'muted', statusGlyph)} ${s.fg(selected ? 'accent' : 'text', option.label)}`;
+        body.push(highlightRow(rowLine, selected));
         hits.set(body.length - 1, { type: 'ask-option', index });
         if (option.description) body.push(`    ${s.fg('faint', truncateToWidth(option.description, Math.max(8, cols - 24)))}`);
       }
       const otherIndex = current.options.length;
       const otherSelected = (dialog.cursor || 0) === otherIndex;
-      const otherMarker = otherSelected ? s.fg('accent', '›') : ' ';
-      body.push(`${otherMarker} ${s.fg(otherSelected ? 'accent' : 'faint', '✦')} ${s.fg(otherSelected ? 'text' : 'muted', 'Other — type your own answer')}`);
+      const otherMarker = otherSelected ? s.fg('accent', '▎') : ' ';
+      body.push(highlightRow(`${otherMarker} ${s.fg(otherSelected ? 'accent' : 'faint', '✦')} ${s.fg(otherSelected ? 'text' : 'muted', 'Other: type your own answer')}`, otherSelected));
       hits.set(body.length - 1, { type: 'ask-other' });
       if (dialog.otherOpen) {
         const text = dialog.otherText || '';
@@ -3594,24 +5153,129 @@ export class App {
         const cell = text.slice(cur, cellEnd) || ' ';
         const rendered = text ? `${text.slice(0, cur)}${s.inverse(cell)}${text.slice(cellEnd)}` : s.inverse(' ');
         body.push('');
-        body.push(`  ${rendered}`);
-        body.push(s.fg('faint', 'type above · enter to submit · esc to go back'));
-      } else {
-        body.push('');
-        body.push(s.fg('faint', current.multiSelect
-          ? '↑↓ select · enter toggle · tab next question · esc cancel'
-          : '↑↓ select · enter pick · esc cancel'));
+        body.push(`  ${paintSurface(` ${padEndVisible(rendered, Math.max(8, dialogInnerWidth - 6))} `, s, 'surface2')}`);
       }
-      return band({ title: 'gatita is asking…', body, hits });
+      const footer = dialog.otherOpen
+        ? 'type answer · enter submit · esc cancel'
+        : (current.multiSelect
+          ? '↑↓ select · enter toggle · tab next question · esc cancel'
+          : '↑↓ select · enter pick · esc cancel');
+      return band({ title: 'gatita is asking…', body, footer, hits });
     }
     if (dialog.type === 'input') {
       const value = dialog.value || '';
       const cellEnd = codePointAfter(value, Math.min(dialog.cursor, value.length));
       const cell = value.slice(dialog.cursor, cellEnd) || ' ';
       const rendered = value ? `${value.slice(0, dialog.cursor)}${s.inverse(cell)}${value.slice(cellEnd)}` : s.inverse(' ');
+      const fieldBox = paintSurface(` ${padEndVisible(rendered, Math.max(8, dialogInnerWidth - 2))} `, s, 'surface2');
       return band({
         title: dialog.title,
-        body: [rendered, '', s.fg('faint', dialog.hint || 'enter to confirm · esc to cancel')],
+        body: [fieldBox],
+        footer: dialog.hint || 'enter confirm · esc cancel',
+      });
+    }
+    if (dialog.type === 'context') {
+      const ctx = this.contextMetrics();
+      const pctLabel = ctx.percent < 10 && ctx.percent > 0 && !Number.isInteger(ctx.percent)
+        ? `${ctx.percent.toFixed(1)}%`
+        : `${Math.round(ctx.percent)}%`;
+      const barColor = ctx.percent >= 85 ? 'danger' : ctx.percent >= 65 ? 'warning' : 'accent';
+      const barW = Math.max(12, Math.min(32, dialogInnerWidth - 28));
+      const body = [
+        `${s.bold(s.fg('text', 'Context'))}  ${progressBar(ctx.percent, barW, s, barColor)}  ${s.bold(s.fg(barColor, pctLabel))}`,
+        `  ${s.fg('muted', `${formatTokens(ctx.usedTokens)} / ${formatTokens(ctx.contextWindow)} tokens`)}`,
+        '',
+        `${s.fg('faint', 'Active in context')}  ${s.fg('text', `${ctx.activeCount} ${plural(ctx.activeCount, 'message')}`)}`,
+        `${s.fg('faint', 'Saved in chat    ')}  ${s.fg('text', `${ctx.totalCount} ${plural(ctx.totalCount, 'message')}`)}`,
+        `${s.fg('faint', 'Auto-compaction  ')}  ${s.fg('muted', `triggers at ${Math.round(AUTO_COMPACT_RATIO * 100)}% · earlier messages stay visible`)}`,
+        '',
+      ];
+      const actionLayout = placeSegments([
+        {
+          text: button(s, 'Compact now', {
+            variant: 'primary',
+            icon: '✦',
+            shortcut: 'c',
+            hovered: this.isHovered('run-compact:'),
+          }),
+          hit: { type: 'run-compact' },
+        },
+      ], { startCol: 0, gap: 2 });
+      const hits = new Map([[body.length, actionLayout.hits]]);
+      body.push(actionLayout.text);
+      return band({
+        title: 'context window',
+        subtitle: this.model()?.name || this.modelId,
+        body,
+        footer: 'c compact now · /compact · esc close',
+        hits,
+      });
+    }
+    if (dialog.type === 'workspace') {
+      const pathText = String(this.cwd || process.cwd());
+      const pathBoxWidth = Math.max(12, dialogInnerWidth - 2);
+      const wrappedPath = wrapPlain(pathText, pathBoxWidth);
+      const skillCount = (this.skills || []).length;
+      const mcpCount = this.mcp?.status?.()?.servers?.length || 0;
+      const body = [
+        s.fg('faint', 'Current working directory for tools, shell commands, and files:'),
+        '',
+        ...wrappedPath.map((line) => paintSurface(` ${padEndVisible(s.bold(s.fg('accent', line)), pathBoxWidth)} `, s, 'surface2')),
+        '',
+        s.fg('muted', `${basenameForDisplay(pathText)}  ·  ${skillCount} ${skillCount === 1 ? 'skill' : 'skills'}  ·  ${mcpCount} mcp`),
+        '',
+      ];
+      const actionLayout = placeSegments([
+        {
+          text: button(s, 'Change directory', {
+            variant: 'primary',
+            icon: '✎',
+            shortcut: 'c',
+            hovered: this.isHovered('change-cwd:'),
+          }),
+          hit: { type: 'change-cwd' },
+        },
+        {
+          text: button(s, 'Copy path', {
+            variant: 'secondary',
+            icon: '▤',
+            shortcut: 'y',
+            hovered: this.isHovered('copy-cwd:'),
+          }),
+          hit: { type: 'copy-cwd' },
+        },
+      ], { startCol: 0, gap: 2 });
+      const hits = new Map([[body.length, actionLayout.hits]]);
+      body.push(actionLayout.text);
+      return band({
+        title: 'working directory',
+        subtitle: basenameForDisplay(pathText),
+        body,
+        footer: 'c change directory · y copy path · /cwd <path> · esc close',
+        hits,
+      });
+    }
+    if (dialog.type === 'tasks') {
+      const body = [];
+      const done = this.todos.filter((t) => t.status === 'completed').length;
+      if (!this.todos.length) {
+        body.push(s.fg('faint', 'No tasks tracked in this chat yet.'));
+      } else {
+        for (const todo of this.todos) {
+          const glyph = todo.status === 'completed' ? s.fg('success', '✓')
+            : todo.status === 'in_progress' ? s.fg('accent', '◐')
+              : s.fg('faint', '○');
+          const tone = todo.status === 'completed' ? 'faint' : 'text';
+          body.push(`  ${glyph} ${s.fg(tone, truncateToWidth(todo.content, Math.max(10, dialogInnerWidth - 6)))}`);
+        }
+      }
+      const maxVisible = Math.max(1, rows - 6);
+      const start = Math.max(0, Math.min(dialog.scroll || 0, Math.max(0, body.length - maxVisible)));
+      return band({
+        title: 'tasks',
+        subtitle: `${done}/${this.todos.length} done`,
+        body: body.slice(start),
+        footer: '↑↓ scroll · enter / esc close',
       });
     }
     if (dialog.type === 'settings') {
@@ -3623,13 +5287,25 @@ export class App {
       ];
       for (const [index, entry] of entries.entries()) {
         const selected = index === (dialog.index || 0);
-        const marker = selected ? s.fg('accent', '›') : ' ';
-        body.push(`${marker} ${s.fg(selected ? 'text' : 'muted', entry.label.padEnd(18))} ${s.fg(entry.value === 'off' ? 'warning' : 'success', entry.value)}`);
+        const marker = selected ? s.fg('accent', '▎') : ' ';
+        const isOff = entry.value === 'off';
+        const isOn = entry.value === 'on';
+        const valPill = isOn
+          ? badge(s, '● on', { fg: 'success', bg: 'successBg' })
+          : isOff
+            ? badge(s, '○ off', { fg: 'warning', bg: 'warningBg' })
+            : badge(s, truncateVisible(entry.value, 22), { fg: 'accent', bg: 'accentBg' });
+        const detail = entry.detail ? `  ${s.fg('faint', entry.detail)}` : '';
+        body.push(highlightRow(`${marker} ${s.fg(selected ? 'text' : 'muted', entry.label.padEnd(18))} ${valPill}${detail}`, selected));
       }
-      body.push('');
-      body.push(s.fg('faint', '↑↓ select · enter change · esc close'));
       const hits = new Map(entries.map((entry, index) => [3 + index, { type: 'setting', key: entry.key }]));
-      return band({ title: 'settings', body, hits });
+      return band({
+        title: 'settings',
+        subtitle: `theme: ${this.config.theme || 'dark'}`,
+        body,
+        footer: '↑↓ select · click or enter / space toggle · esc close',
+        hits,
+      });
     }
     if (dialog.type === 'permissions') {
       const keys = this.dialogItems(dialog);
@@ -3639,22 +5315,30 @@ export class App {
         ...keys.map((key, index) => {
           const selected = index === (dialog.index || 0);
           const enabled = Boolean(this.config.autoApprove[key]);
-          const marker = selected ? s.fg('accent', '›') : ' ';
-          const state = enabled ? s.fg('success', 'allowed') : s.fg('warning', 'ask first');
-          return `${marker} ${s.fg(selected ? 'text' : 'muted', key.padEnd(10))} ${state}`;
+          const marker = selected ? s.fg('accent', '▎') : ' ';
+          const state = enabled
+            ? badge(s, '● allowed', { fg: 'success', bg: 'successBg' })
+            : badge(s, '○ ask first', { fg: 'warning', bg: 'warningBg' });
+          return highlightRow(`${marker} ${s.fg(selected ? 'text' : 'muted', key.padEnd(12))} ${state}`, selected);
         }),
-        '',
-        s.fg('faint', 'space or enter toggles · esc closes'),
       ];
       const hits = new Map(keys.map((key, index) => [2 + index, { type: 'permission', key }]));
-      return band({ title: 'permissions', body, hits });
+      return band({
+        title: 'permissions',
+        body,
+        footer: '↑↓ select · click or space / enter toggle · esc close',
+        hits,
+      });
     }
     if (dialog.type === 'usage') {
       const data = dialog.data;
       const body = [];
+      const hits = new Map();
       for (const window of data.windows || []) {
-        body.push(`${s.fg('text', window.label.padEnd(8))} ${progressBar(window.percent, 24, s, window.percent >= 90 ? 'danger' : 'accent')} ${s.fg('muted', `${formatTokens(window.used)} / ${formatTokens(window.limit)}`)}`);
-        if (window.resetAt) body.push(`  ${s.fg('faint', `resets in ${formatDuration(Math.max(0, window.resetAt - Date.now()), { compact: true })}`)}`);
+        const pct = Math.max(0, Math.min(100, Number(window.percent) || 0));
+        const barColor = pct >= 90 ? 'danger' : pct >= 75 ? 'warning' : 'accent';
+        body.push(`${s.bold(s.fg('text', window.label.padEnd(8)))} ${progressBar(pct, 24, s, barColor)} ${s.fg('muted', `${formatTokens(window.used)} / ${formatTokens(window.limit)}`)}`);
+        if (window.resetAt) body.push(`  ${s.fg('faint', `${pct.toFixed(pct < 10 ? 1 : 0)}% used · resets in ${formatDuration(Math.max(0, window.resetAt - Date.now()), { compact: true })}`)}`);
       }
       const banked = data.bankedResets;
       if (banked) {
@@ -3664,132 +5348,249 @@ export class App {
             ? `oldest expires in ${formatDuration(Math.max(0, banked.nextExpiresAt - Date.now()), { compact: true })}`
             : '';
           body.push(`${s.fg('accent', '◆')} ${s.fg('text', `banked resets: ${banked.count}`)}  ${s.fg('faint', expiry)}`);
-          body.push(`  ${s.fg('faint', '/reset uses one now')}`);
         } else {
           body.push(`${s.fg('faint', 'no banked resets')}`);
         }
       }
       body.push('');
       body.push(`${s.fg('muted', `Last 30 days: ${formatTokens(data.totals.tokens)} tokens across ${plural(data.totals.requests, 'request')}`)}`);
-      body.push('');
-      for (const model of (data.models || []).slice(0, 6)) {
-        body.push(`  ${s.fg('text', model.modelId.padEnd(18))} ${s.fg('muted', formatTokens(model.tokens).padStart(8))}  ${s.fg('faint', plural(model.requests, 'request'))}`);
+      const usageModels = (data.models || []).slice(0, 6);
+      if (usageModels.length) {
+        body.push('');
+        const maxTok = Math.max(1, ...usageModels.map((m) => Number(m.tokens) || 0));
+        for (const model of usageModels) {
+          const share = Math.round(((Number(model.tokens) || 0) / maxTok) * 100);
+          body.push(`  ${s.fg('text', model.modelId.padEnd(16))} ${progressBar(share, 12, s, 'info')} ${s.fg('muted', formatTokens(model.tokens).padStart(7))}  ${s.fg('faint', plural(model.requests, 'request'))}`);
+        }
       }
       body.push('');
-      body.push(s.fg('faint', 'esc closes · /reset uses a banked reset'));
-      const start = Math.max(0, Math.min(dialog.scroll || 0, Math.max(0, body.length - (rows - 2))));
+      const usageButtons = [
+        {
+          text: button(s, 'Manage Plan', {
+            variant: 'primary',
+            icon: '✦',
+            trailing: '↗',
+            hovered: this.isHovered('open-plan:'),
+          }),
+          hit: { type: 'open-plan' },
+        },
+      ];
+      if (banked?.count > 0) {
+        usageButtons.push({
+          text: button(s, 'Use Banked Reset', {
+            variant: 'secondary',
+            icon: '↻',
+            hovered: this.isHovered('use-banked-reset:'),
+          }),
+          hit: { type: 'use-banked-reset' },
+        });
+      }
+      const actionLayout = placeSegments(usageButtons, { startCol: 0, gap: 2 });
+      const actionLineIdx = body.length;
+      body.push(actionLayout.text);
+
+      const maxVisible = Math.max(1, rows - 5);
+      const start = Math.max(0, Math.min(dialog.scroll || 0, Math.max(0, body.length - maxVisible)));
+      if (actionLineIdx >= start && actionLineIdx < start + maxVisible) {
+        hits.set(actionLineIdx - start, actionLayout.hits);
+      }
       return band({
         title: 'usage',
+        subtitle: (data.plan?.displayName || this.plan?.displayName || 'Free').replace(/^Gatita\s+/i, '').toLowerCase(),
         body: body.slice(start),
+        footer: '/reset uses a banked reset · ↑↓ scroll · esc close',
+        hits,
       });
     }
     if (dialog.type === 'text') {
       const body = Array.isArray(dialog.body) ? dialog.body : [];
-      const start = Math.max(0, Math.min(dialog.scroll || 0, Math.max(0, body.length - (rows - 2))));
+      const maxVisible = Math.max(1, rows - 5);
+      const start = Math.max(0, Math.min(dialog.scroll || 0, Math.max(0, body.length - maxVisible)));
       return band({
         title: dialog.title || 'gatita',
+        subtitle: body.length > maxVisible ? `${start + 1}-${Math.min(body.length, start + maxVisible)}/${body.length}` : '',
         body: body.slice(start),
+        footer: '↑↓ scroll · enter / esc close',
       });
     }
     if (dialog.type === 'help') {
       const body = [];
-      body.push(s.fg('accent', 'keys'));
+      body.push(s.bold(s.fg('accent', 'KEYS & NAVIGATION')));
       for (const line of [
         'enter send · shift+enter (or ctrl+j) newline',
+        'ctrl+p open command palette (tab switches Quick / Commands / Models / Themes / Chats)',
+        'alt+← / alt+→ cycle chat tabs · alt+1..9 jump to tab · /chats browse all chats',
         'ctrl+t toggle work details · ctrl+r toggle thinking · m expand/minimize all thoughts',
-        'type while gatita works and press enter — your message steers her after the next tool finishes',
+        'type while gatita works and press enter to steer her after the next tool finishes',
         'tab complete · up/down move in the suggestion list · enter accepts it',
-        'ctrl+v or right click pastes text or an image · multi-line text collapses into a pasted-lines box',
+        'ctrl+v or right click pastes text or an image · multi-line text collapses into a chip',
         'esc interrupt · ctrl+c cancel or quit',
-        'terminal bell plus a synthesized chime: once when gatita needs you and twice when done · /sound toggles',
-        'drag with the left mouse button to select text — release to copy',
-        'selections stay inside one section: sidebar, conversation, or composer',
-        'gatita can ask multiple-choice questions (with an "other" option) — she keeps preparing safely while you answer',
-        'multi-line selections are copied inside a markdown code fence',
-        'double-click selects a word · triple-click selects a line',
-        'pageup/pagedown or mouse wheel scrolls · ctrl+o expand tool · m minimize/expand thoughts',
-        'left click folders · recent chats · model/chat pickers · suggestion rows',
-        'up/down history · ctrl+a/e line start/end',
+        'drag with the left mouse button to select text and release to copy',
+        'click tabs, × close, + new tab, plan badge (opens gatita.tech/api#plan), and toolbar buttons',
+        'pageup/pagedown or mouse wheel scrolls · ctrl+o expand tool output',
         '@skill-name mentions an installed skill · @ + tab autocompletes',
-        'skills live globally in ~/.gatita-studio/skills/<name>/SKILL.md (see the premade example folder)',
       ]) body.push(`  ${s.fg('muted', line)}`);
       body.push('');
-      body.push(s.fg('accent', 'commands'));
+      body.push(s.bold(s.fg('accent', 'COMMANDS')));
       for (const command of SLASH_COMMANDS) {
         body.push(`  ${s.fg('text', `/${command.name}`.padEnd(13))} ${s.fg('faint', command.description)}`);
       }
       body.push('');
       body.push(s.fg('faint', '  /admin commands work only for admin accounts.'));
-      const start = Math.max(0, Math.min(dialog.scroll || 0, Math.max(0, body.length - (rows - 2))));
-      return band({ title: 'help', body: body.slice(start) });
+      const maxVisible = Math.max(1, rows - 5);
+      const start = Math.max(0, Math.min(dialog.scroll || 0, Math.max(0, body.length - maxVisible)));
+      return band({
+        title: 'help',
+        subtitle: `v${CLIENT_VERSION} · ${start + 1}-${Math.min(body.length, start + maxVisible)}/${body.length}`,
+        body: body.slice(start),
+        footer: '↑↓ / pageup / pagedown scroll · esc close',
+      });
     }
     if (dialog.type === 'models') {
       const items = this.dialogItems(dialog);
       const body = [];
-      const filter = dialog.filter ? `filter: ${dialog.filter}` : 'type to filter';
-      body.push(s.fg('faint', filter));
+      const filterInner = dialog.filter
+        ? `${s.fg('accent', '⌕')}  ${s.fg('text', dialog.filter)}${s.inverse(' ')}`
+        : `${s.fg('accent', '⌕')}  ${s.fg('faint', 'Type to filter Gatita models…')}`;
+      body.push(paintSurface(` ${padEndVisible(truncateVisible(filterInner, dialogInnerWidth - 2), dialogInnerWidth - 2)} `, s, 'surface2'));
       body.push('');
-      if (!items.length) body.push(s.fg('faint', 'No models match.'));
-      items.slice(0, Math.max(1, rows - 6)).forEach((model, index) => {
-        const selected = index === (dialog.index || 0);
-        const marker = selected ? s.fg('accent', '›') : ' ';
-        const name = model.id === this.modelId ? s.fg('accent', model.name) : s.fg(selected ? 'text' : 'muted', model.name);
+      const maxVisible = Math.max(1, rows - 10);
+      const visible = items.slice(0, maxVisible);
+      if (!visible.length) body.push(s.fg('faint', 'No Gatita models match.'));
+      const selectedIdx = Math.max(0, Math.min(visible.length - 1, dialog.index || 0));
+      visible.forEach((model, index) => {
+        const selected = index === selectedIdx;
+        const active = model.id === this.modelId;
+        const marker = selected ? s.fg('accent', '▎') : active ? s.fg('success', '●') : ' ';
+        const nameCol = padEndVisible(model.name, 14);
+        const name = active ? s.bold(s.fg('accent', nameCol)) : s.fg(selected ? 'text' : 'muted', nameCol);
         const badges = [
-          model.tools ? s.fg('muted', 'tools') : s.fg('faint', 'chat'),
-          model.vision ? s.fg('info', 'vision') : '',
-          model.reasoningLevels.length ? s.fg('accent2', `think ${model.reasoningLevels.join('/')}`) : '',
-          model.available ? '' : s.fg('warning', `needs ${model.requiredPlan}`),
+          model.tools ? s.pill('muted', 'surface3', 'tools') : s.pill('faint', 'surface2', 'chat'),
+          model.vision ? s.pill('info', 'infoBg', 'vision') : '',
+          model.reasoningLevels.length ? s.pill('accent2', 'accent2Bg', `think ${model.reasoningLevels.join('/')}`) : '',
+          model.available ? '' : s.pill('warning', 'warningBg', `needs ${model.requiredPlan}`),
         ].filter(Boolean).join(' ');
-        body.push(`${marker} ${name.padEnd ? name : name} ${s.fg('faint', formatTokens(model.contextWindow).padStart(6))} ${badges}`);
+        body.push(highlightRow(`${marker} ${name} ${s.fg('faint', formatTokens(model.contextWindow).padStart(6))} ${badges}`, selected));
       });
-      body.push('');
-      body.push(s.fg('faint', '↑↓ select · enter choose · esc close'));
+      const focusedModel = visible[selectedIdx];
+      if (focusedModel?.description) {
+        body.push('');
+        body.push(s.fg('muted', truncateVisible(focusedModel.description, dialogInnerWidth)));
+      }
       const hits = new Map();
-      items.slice(0, Math.max(1, rows - 6)).forEach((model, index) => {
+      visible.forEach((model, index) => {
         hits.set(2 + index, { type: 'model', id: model.id });
       });
-      return band({ title: 'model', body, hits });
+      return band({
+        title: 'gatita models',
+        subtitle: (this.plan?.displayName || 'Free').replace(/^Gatita\s+/i, '').toLowerCase(),
+        body,
+        footer: '↑↓ select · click or enter choose · type to filter · esc close',
+        hits,
+      });
     }
     if (dialog.type === 'sessions') {
       const items = this.dialogItems(dialog);
+      const openSet = new Set(this.openTabIds || []);
       const body = [];
-      body.push(s.fg('faint', dialog.filter ? `filter: ${dialog.filter}` : 'type to filter · tab new chat'));
-      body.push('');
-      if (!items.length) body.push(s.fg('faint', 'No chats match.'));
-      items.slice(0, Math.max(1, rows - 6)).forEach((chat, index) => {
-        const selected = index === (dialog.index || 0);
-        const marker = selected ? s.fg('accent', '›') : ' ';
-        const title = chat.id === this.chat?.id ? s.fg('accent', chat.title) : s.fg(selected ? 'text' : 'muted', chat.title);
-        const meta = s.fg('faint', `${chat.messageCount} msg · ${formatDuration(Date.now() - chat.updatedAt, { compact: true })} ago`);
-        body.push(`${marker} ${title}`);
-        body.push(`    ${meta}`);
-      });
-      body.push('');
-      body.push(s.fg('faint', '↑↓ select · enter resume · tab new · esc close'));
       const hits = new Map();
-      items.slice(0, Math.max(1, rows - 6)).forEach((chat, index) => {
-        hits.set(2 + index * 2, { type: 'session', id: chat.id });
+
+      const newChatBtn = button(s, 'New chat', {
+        variant: 'primary',
+        icon: '+',
+        hovered: this.isHovered('new-chat:'),
       });
-      return band({ title: 'sessions', body, hits });
+      const newBtnW = visibleWidth(newChatBtn);
+      const searchW = Math.max(12, dialogInnerWidth - newBtnW - 2);
+      const searchInner = dialog.filter
+        ? `${s.fg('accent', '⌕')} ${s.fg('text', dialog.filter)}${s.inverse(' ')}`
+        : `${s.fg('accent', '⌕')} ${s.fg('faint', 'Filter chats…')}`;
+      const searchBox = paintSurface(` ${padEndVisible(truncateVisible(searchInner, searchW - 2), searchW - 2)} `, s, 'surface2');
+      body.push(`${searchBox}  ${newChatBtn}`);
+      hits.set(0, [{ type: 'new-chat', col: searchW + 2, width: newBtnW }]);
+      body.push(s.fg('border', '─'.repeat(dialogInnerWidth)));
+
+      const maxVisible = Math.max(1, Math.min(10, rows - 10));
+      const selectedIdx = Math.max(0, Math.min(items.length - 1, dialog.index || 0));
+      const windowStart = Math.max(0, Math.min(items.length - maxVisible, selectedIdx - Math.floor(maxVisible / 2)));
+      const visible = items.slice(Math.max(0, windowStart), Math.max(0, windowStart) + maxVisible);
+
+      if (!visible.length) {
+        body.push(s.fg('faint', '  No chats match. Click "+ New chat" or press tab to start one.'));
+      } else {
+        visible.forEach((chat, offset) => {
+          const idx = Math.max(0, windowStart) + offset;
+          const selected = idx === selectedIdx;
+          const active = chat.id === this.chat?.id;
+          const isOpen = openSet.has(chat.id);
+          const marker = selected ? s.fg('accent', '▎') : ' ';
+          const statusDot = active ? s.fg('accent', '●') : isOpen ? s.fg('info', '○') : s.fg('faint', '·');
+          const delHovered = this.isHovered(`delete-chat:${chat.id}`);
+          const delBtn = delHovered
+            ? paintSurface(s.bold(s.fg('danger', ' × ')), s, 'dangerBg')
+            : s.fg('faint', ' × ');
+          const delW = visibleWidth(delBtn);
+          const age = chat.updatedAt ? `${formatDuration(Math.max(0, Date.now() - chat.updatedAt), { compact: true })} ago` : '';
+          const metaStr = `${chat.messageCount || 0} msg${age ? ` · ${age}` : ''}`;
+          const metaStyled = s.fg('faint', metaStr);
+          const metaW = visibleWidth(metaStr);
+          const titleBudget = Math.max(8, dialogInnerWidth - metaW - delW - 8);
+          const titleRaw = truncateVisible(chat.title || 'New chat', titleBudget);
+          const titleStyled = active ? s.bold(s.fg('accent', titleRaw)) : s.fg(selected ? 'text' : 'muted', titleRaw);
+          const leftPart = `${marker} ${statusDot} ${titleStyled}`;
+          const gap = Math.max(1, dialogInnerWidth - visibleWidth(leftPart) - metaW - delW - 1);
+          const rowText = `${leftPart}${' '.repeat(gap)}${metaStyled} ${delBtn}`;
+          body.push(highlightRow(rowText, selected));
+          const rowIdx = body.length - 1;
+          hits.set(rowIdx, [
+            { type: 'session', id: chat.id, col: 0, width: Math.max(1, dialogInnerWidth - delW) },
+            { type: 'delete-chat', id: chat.id, col: Math.max(0, dialogInnerWidth - delW), width: delW },
+          ]);
+        });
+      }
+      const openCount = this.openTabs().length;
+      return band({
+        title: 'chats',
+        subtitle: `${items.length} total · ${openCount} ${openCount === 1 ? 'tab' : 'tabs'}`,
+        body,
+        footer: '↑↓ select · enter open tab · tab new · d delete · esc close',
+        hits,
+      });
     }
     if (dialog.type === 'folders') {
       const body = [];
+      const hits = new Map();
       const selectedIndex = dialog.index || 0;
-      const allMarker = selectedIndex === 0 ? s.fg('accent', '›') : ' ';
-      body.push(`${allMarker} ${s.fg(selectedIndex === 0 ? 'text' : 'muted', 'all chats')} ${s.fg('faint', 'no folder')}`);
+      const allMarker = selectedIndex === 0 ? s.fg('accent', '▎') : ' ';
+      body.push(highlightRow(`${allMarker} ${s.fg(selectedIndex === 0 ? 'text' : 'muted', 'all chats')} ${s.fg('faint', 'no folder')}`, selectedIndex === 0));
+      hits.set(0, { type: 'folder', id: null });
       this.folders.forEach((folder, index) => {
         const selected = index + 1 === selectedIndex;
-        body.push(`${selected ? s.fg('accent', '›') : ' '} ${s.fg(selected ? 'text' : 'muted', folder.name)} ${s.fg('faint', `${folder.chatCount} chats`)}`);
-      });
-      body.push('');
-      body.push(s.fg('faint', 'enter use folder · n new folder · esc close'));
-      const hits = new Map([[0, { type: 'folder', id: null }]]);
-      this.folders.forEach((folder, index) => {
+        body.push(highlightRow(`${selected ? s.fg('accent', '▎') : ' '} ${s.fg(selected ? 'text' : 'muted', folder.name)} ${s.fg('faint', `${folder.chatCount} chats`)}`, selected));
         hits.set(1 + index, { type: 'folder', id: folder.id });
       });
-      return band({ title: 'folders', body, hits });
+      body.push('');
+      const newFolderLayout = placeSegments([
+        {
+          text: button(s, 'New folder', {
+            variant: 'secondary',
+            icon: '+',
+            shortcut: 'n',
+            hovered: this.isHovered('new-folder:'),
+          }),
+          hit: { type: 'new-folder' },
+        },
+      ], { startCol: 0, gap: 1 });
+      body.push(newFolderLayout.text);
+      hits.set(body.length - 1, newFolderLayout.hits);
+      return band({
+        title: 'folders',
+        body,
+        footer: 'enter use folder · n new folder · esc close',
+        hits,
+      });
     }
-    return band({ title: 'gatita', body: [s.fg('muted', 'Nothing here. esc closes.')] });
+    return band({ title: 'gatita', body: [s.fg('muted', 'Nothing here.')], footer: 'esc close' });
   }
 }
 
